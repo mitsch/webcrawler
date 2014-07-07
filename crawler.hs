@@ -44,37 +44,25 @@ mapM'_ _ [] = return ()
 mapM'_ f (a:as) = (f a) >>= (\y -> y `seq` mapM'_ f as)
 
 
-data DownloadResult = TimeOut | NetworkError String | HTTPDocument (Response String)
-type SHR = Result (Response String)
 
-download ::Maybe Int -> Maybe Int -> String -> [URI] -> IO [(URI, DownloadResult)]
-download maxWaitTime timeOut agent urls = do
+downloader ::Maybe Int -> Maybe Int -> String -> Chan URI -> Chan (URI, Response String) -> Chan String -> IO ()
+downloader maxWaitTime timeOut agent urlChan responseChan logChan = do
+	urls <- getChanContents urlChan
 	clockTime <- getClockTime
 	let randomNumbers n = randomRs (0, n) $ mkStdGen $ ctMin $ toUTCTime clockTime
 	let waitingTime = maybe (repeat 0) randomNumbers maxWaitTime
-	return (zip urls waitingTime) >>= mapM (\(u, w) -> do
-		hPutStrLn stderr "download before waiting"
-		when (isJust maxWaitTime) (hPutStrLn stderr "download do waiting" >> threadDelay w)
+	return (zip urls waitingTime) >>= mapM_ (\(u, w) -> do
+		when (isJust maxWaitTime) (threadDelay w)
 		let tryTimeOut = maybe (liftM Just) timeout timeOut
-		hPutStrLn stderr "download about to download"
 		result <- try $ tryTimeOut $ simpleHTTP $ insertHeader HdrUserAgent agent $ getRequest $ show u
-		r <- case result of
-			Left err -> hPutStrLn stderr "a" >> return (u, NetworkError $ show (err :: SomeException))
-			Right Nothing -> hPutStrLn stderr "b" >> return (u, TimeOut)
-			Right (Just (Left err)) -> hPutStrLn stderr "c" >> return (u, NetworkError $ show err)
-			Right (Just (Right resp)) -> hPutStrLn stderr "d" >> return (u, HTTPDocument resp)
-		hPutStrLn stderr "download should be finished"
-		return r)
+		case result of
+			Left err -> writeChan logChan ("network error\t" ++ (show u) ++ "\t" ++ (show (err :: SomeException)))
+			Right Nothing -> writeChan logChan ("timeout\t" ++ (show u)) >> writeChan urlChan u
+			Right (Just (Left err)) -> writeChan logChan ("network error\t" ++ (show u) ++ "\t" ++ (show (err :: ConnError)))
+			Right (Just (Right resp)) -> writeChan logChan ("download\t" ++ (show u)) >> writeChan responseChan (u, resp))
 
-downloader :: Maybe Int -> Maybe Int -> String -> Chan URI -> Chan (URI, Response String) -> Chan String -> IO ()
-downloader maxWaitTime timeOut agent urlChan responseChan logChan = do
-	urls <- getChanContents urlChan
-	downloadResults <- download maxWaitTime timeOut agent urls
-	mapM_ (\(u, r) -> case r of
-			TimeOut -> writeChan logChan ("timeout\t" ++ (show u)) >> writeChan urlChan u
-			NetworkError reason -> writeChan logChan ("network error\t" ++ (show u) ++ "\t" ++ reason)
-			HTTPDocument resp -> writeChan logChan ("download\t" ++ (show u)) >> writeChan responseChan (u, resp)
-		) downloadResults
+
+
 
 data ParseResult = HTTPError (Int, Int, Int) String | Redirection URI | InvalidType String | ParsedReferences [(URI, [String])]
 
@@ -124,8 +112,7 @@ parser loopBack respChan outputChan logChan trackChan =
 	    handle (u, Redirection loc) = markRedirection u loc >> markPageVisit u >> reportPageVisit u >> when loopBack (push loc);
 	    handle (u, InvalidType mime) = reportInvalidType u mime >> maybe mzero pushi (getSuffix u);
 	    handle (u, ParsedReferences refs) = markReferences u refs >> markPageVisit u >> reportPageVisit u >> when loopBack (pushs refs);
-			g = mapM (\s -> hPutStrLn stderr ("parser before " ++ (show $ fst s)) >> return s)
-	in getChanContents respChan >>= g >>= return . parse >>= g >>= mapM'_ handle
+	in getChanContents respChan >>= return . parse >>= mapM'_ handle
 
 
 
@@ -148,7 +135,7 @@ tracker badSuffixes history trackChan urlChan =
 
 
 data Flag = Help | Looping Bool | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int | Parsers Int | BadSuffixes FilePath |
-            Histories FilePath | BadSuffix String | History String
+            Histories FilePath | BadSuffix String | History String | SyncOutput
 
 options :: [OptDescr Flag]
 options = [
@@ -165,12 +152,13 @@ options = [
 	Option "" ["bad-suffixes"] (ReqArg (\s -> BadSuffixes s) "FILE") "FILE contains list of suffixes which indicate no html resources",
 	Option "" ["histories"] (ReqArg (\s -> Histories s) "FILE") "FILE contains urls which were already visited",
 	Option "b" ["bad-suffix"] (ReqArg (\s -> BadSuffix s) "SUFFIX") "SUFFIX indicates no html resource",
-	Option "h" ["history"] (ReqArg (\s -> History s) "URL") "URL is considered to be already visited"]
+	Option "h" ["history"] (ReqArg (\s -> History s) "URL") "URL is considered to be already visited",
+	Option "" ["sync-output"] (NoArg SyncOutput) "synchronises output and log messages"]
 
 
 main :: IO ()
 main = do
-	(originSeeds, doLooping, userAgent, timeOut, sleepTime, parserN, badSuffixes, history) <- getArgs >>= (\args ->
+	(originSeeds, doLooping, userAgent, timeOut, sleepTime, parserN, badSuffixes, history, syncOutput) <- getArgs >>= (\args ->
 		case getOpt Permute options args of
 			(o,n,[]) -> do
 				let needHelp = any (\f -> case f of {Help->True;_->False}) o
@@ -195,16 +183,20 @@ main = do
 				let (invalidHFC, validHFC) = partitionEithers historyFilesContents
 				mapM_ (\s -> hPutStrLn stderr $ "invalid absolute uri \"" ++ s ++ "\" in history will be ignored!") $
 					invalidHistories ++ invalidHFC
+				let syncOutput = any (\f -> case f of {SyncOutput->True;_->False}) o
 				return (validSeeds, doLooping, userAgent, timeOut, sleepTime, parserN,
 				        fromList $ badSuffixes ++ badSuffixFilesContents,
-				        fromList $ validHistories ++ validHFC)
+				        fromList $ validHistories ++ validHFC, syncOutput)
 			(_,_,errs) -> ioError (userError (concat errs ++ usageInfo "usage: crawler [OPTION ...] urls..." options)))
 	seedChan <- newChan
 	logChan <- newChan
 	respChan <- newChan
 	outputChan <- newChan
 	trackChan <- newChan
-	finisher <- newQSemN $ 0
+	finisher <- newQSemN $ 0	
+	let completeLogMessage l c = (showTimeStamp c) ++ "\t" ++ l
+	logThread <- forkIO (getChanContents logChan >>= mapM_ (\l -> getClockTime >>=
+		(if syncOutput then writeChan outputChan else hPutStrLn stderr) . completeLogMessage l) >> signalQSemN finisher 1)
 	downloadThread <- forkIO (writeChan logChan "started download thread" >>
 		downloader sleepTime timeOut userAgent seedChan respChan logChan >> signalQSemN finisher 1)
 --	parserThreads <- replicateM parserN $ forkIO ( writeChan logChan "started parser thread" >>
@@ -214,7 +206,6 @@ main = do
 		tracker badSuffixes history trackChan seedChan >> signalQSemN finisher 1)
 	outputThread <- forkIO ( writeChan logChan "started output thread" >>
 		getChanContents outputChan >>= mapM_ putStrLn >> signalQSemN finisher 1)
-	logThread <- forkIO (getChanContents logChan >>= mapM_ (\l -> getClockTime >>= (\c -> hPutStrLn stderr $ (showTimeStamp c) ++ "\t" ++ l)) >> signalQSemN finisher 1)
 	writeList2Chan seedChan originSeeds
 	getContents >>= return . map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) . lines >>= mapM_ (\t ->
 		case t of
