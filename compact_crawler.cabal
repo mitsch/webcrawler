@@ -15,7 +15,7 @@ build-type:          Simple
 cabal-version:       >=1.8
 
 library
-  build-depends:       uri, HTTP, tagsoup, network, monad-loops, base == 4.5.*, containers, transformers
+  build-depends:       uri, HTTP, tagsoup, network, monad-loops, base >= 4.6, containers, transformers
   exposed-modules:     Ring, Tracker, Robots, Parser
   extensions:          DoAndIfThenElse
 
@@ -23,6 +23,6 @@ executable compact_crawler
   main-is:             crawler.hs
   other-modules:       Ring, Tracker, Robots
   hs-source-dirs:      .
-  build-depends:       base ==4.5.*, uri, HTTP, tagsoup, MissingH, network, monad-loops, unix, old-time, containers, random, http-conduit, bytestring, http-types, http-client, http-client-tls, transformers
+  build-depends:       base >= 4.6, uri, HTTP, tagsoup, MissingH, network, monad-loops, unix, old-time, containers, random, http-conduit, bytestring, http-types, http-client, http-client-tls, transformers
   ghc-options:         -Wall -O6 -threaded
   extensions:          DoAndIfThenElse
