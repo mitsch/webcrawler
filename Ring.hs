@@ -18,7 +18,7 @@ module Ring (
 
 import Prelude hiding (log)
 import Control.Concurrent.Chan
-import System.IO
+import System.IO()
 import Control.Monad
 import Control.Monad.Trans.Class
 
