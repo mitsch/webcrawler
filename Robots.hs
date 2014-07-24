@@ -3,7 +3,7 @@ module Robots (Robots, makeRobots, makeEmptyRobots, isRobotsConform, unionRobots
 import Network.URI
 import Prelude
 import Data.Maybe
-import Data.List
+import Data.List hiding (group)
 
 -- splits on every element whose prediction p returns True
 splitOn :: (a -> Bool) -> [a] -> [[a]]
