@@ -1,164 +1,288 @@
 module Main where
 
-import Text.HTML.TagSoup 
+import Prelude hiding (log, max)
 import System.Console.GetOpt
 import System.Environment
-import Network.HTTP
+import Network.HTTP.Conduit
+import Network.HTTP.Types.Status
+import Network.HTTP.Types.Header
+import Network.HTTP.Types.Method
+import Network.HTTP.Client.TLS
 import Network.URI
-import Network.Stream
+import Network.Stream()
 import System.IO
-import System.Posix.Signals
+import System.Posix.Signals()
 import System.Exit
 import System.Time
 import System.Random
-import System.Timeout
 import Control.Monad
+import Control.Monad.Trans.Class
 import Control.Concurrent
-import Control.Exception
-import Control.Concurrent.Chan
-import Control.Concurrent.QSemN
+import Control.Exception hiding (handle)
+import Control.Concurrent.Chan()
+import Control.Concurrent.MVar()
 import Data.Maybe
 import Data.Set (Set, insert, member, fromList)
 import Data.List
 import Data.Either
+import qualified Data.ByteString.Char8 as S
+import qualified Data.ByteString.Lazy.Char8 as L
+import Parser
+import Robots
+import Ring
+
+
 
 -- splits on every element whose prediction p returns True
 splitOn :: (a -> Bool) -> [a] -> [[a]]
 splitOn _ [] = []
 splitOn p x = let (a,b) = break p x in a:(splitOn p $ drop 1 b)
 
+-- writes temporary file which is not deleted at the end
+writeTempLivingFile :: FilePath -> String -> L.ByteString -> IO String
+writeTempLivingFile folder fileNamePattern content = do
+	(filePath, handle) <- openTempFile folder fileNamePattern
+	L.hPutStr handle content
+	hClose handle
+	return filePath
+
+isSameDomain :: URI -> URI -> Bool
+isSameDomain a b = fromMaybe False $ do
+	let getDomainStack = dropWhile null . reverse . splitOn ('.'==)
+	aRegName <- uriAuthority a >>= return . getDomainStack . uriRegName
+	bRegName <- uriAuthority b >>= return . getDomainStack . uriRegName
+	return $ length aRegName == length bRegName && (and $ zipWith (==) aRegName bRegName)
+
 
 getSuffix :: URI -> Maybe String
-getSuffix = maybe mzero (listToMaybe . reverse . drop 1 . splitOn ('.'==)) . listToMaybe . reverse . splitOn ('/'==) . uriPath
-
-showTimeStamp :: ClockTime -> String
-showTimeStamp c = let b = toUTCTime c in (show $ ctYear b) ++ "-" ++ (show $ ctMonth b) ++ "-" ++ (show $ ctDay b) ++ "-" ++ (show $ ctHour b) ++ "-" ++ (show $ ctMin b) ++ "-" ++ (show $ ctSec b)
+getSuffix = maybe Nothing (listToMaybe . reverse . drop 1 . splitOn ('.'==)) . listToMaybe . reverse . splitOn ('/'==) . uriPath
 
 
-mapM' :: Monad m => (a -> m b) -> [a] -> m [b]
-mapM' _ [] = return []
-mapM' f (a:as) = (f a) >>= (\y -> y `seq` mapM' f as)
+switchMaybe :: a -> Maybe b -> Maybe a
+switchMaybe _ (Just _) = Nothing
+switchMaybe x Nothing = Just x
 
-mapM'_ :: Monad m => (a -> m ()) -> [a] -> m ()
-mapM'_ _ [] = return ()
-mapM'_ f (a:as) = (f a) >>= (\y -> y `seq` mapM'_ f as)
+mapM'_ :: Monad m => (a -> m b) -> [a] -> m ()
+mapM'_ f = g
+	where g (x:xs) = f x >>= (\y -> y `seq` (g xs))
+	      g [] = return ()
 
+data MyOutput = StdOut String | StdErr String | StdOutFlush
 
+-- puts to standard output
+put :: OutputChan MyOutput -> String -> IO ()
+put c m = writeOutputChan c $ StdOut m
 
-downloader ::Maybe Int -> Maybe Int -> String -> Chan URI -> Chan (URI, Response String) -> Chan String -> IO ()
-downloader maxWaitTime timeOut agent urlChan responseChan logChan = do
-	urls <- getChanContents urlChan
+-- puts list to standard output
+putList :: OutputChan MyOutput -> [String] -> IO ()
+putList c ms = writeListOutputChan c $ map StdOut ms
+
+-- logs to standard error
+log :: OutputChan MyOutput -> String -> IO ()
+log c m = do
+	time <- getClockTime >>= toCalendarTime
+	let ctTZTime = ctTZ time
+	let timeT = (show $ ctYear time) ++ "-" ++ (show $ ctMonth time) ++ "-" ++ (show $ ctDay time) ++ "T" ++
+	            (show $ ctHour time) ++ ":" ++ (show $ ctMin time) ++ ":" ++ (show $ ctSec time) ++ "+" ++
+	            (show $ ctTZTime `div` 3600) ++ ":" ++ (show $ ((ctTZTime `div` 60) `mod` 60))
+	writeOutputChan c $ StdErr $ timeT ++ "\t" ++ m
+
+-- logs list to standard error
+logList :: OutputChan MyOutput -> [String] -> IO ()
+logList c ms = do
+	time <- getClockTime >>= toCalendarTime
+	let ctTZTime = ctTZ time
+	let timeT = (show $ ctYear time) ++ "-" ++ (show $ ctMonth time) ++ "-" ++ (show $ ctDay time) ++ "T" ++
+	            (show $ ctHour time) ++ ":" ++ (show $ ctMin time) ++ ":" ++ (show $ ctSec time) ++ "+" ++
+							(show $ ctTZTime `div` 3600) ++ ":" ++ (show $ ((ctTZTime `div` 60) `mod` 60))
+	writeListOutputChan c $ map (\m -> StdErr $ timeT ++ "\t" ++ m) ms
+
+flushOutput :: OutputChan MyOutput -> IO ()
+flushOutput c = writeOutputChan c StdOutFlush
+
+-- download settings for web page download
+data DownloadSettings = DownloadSettings {
+	downloadMaximumSleepTime :: Maybe Int,
+	downloadMaximumTimeOut :: Maybe Int,
+	downloadUserAgent :: String}
+
+-- downloader routine
+downloader :: DownloadSettings -> RingChan URI -> RingChan (URI, Response L.ByteString) -> OutputChan MyOutput -> IO ()
+downloader settings urlChannel responseChannel outputChannel = do
 	clockTime <- getClockTime
-	let randomNumbers n = randomRs (0, n) $ mkStdGen $ ctMin $ toUTCTime clockTime
-	let waitingTime = maybe (repeat 0) randomNumbers maxWaitTime
-	return (zip urls waitingTime) >>= mapM_ (\(u, w) -> do
-		when (isJust maxWaitTime) (threadDelay w)
-		let tryTimeOut = maybe (liftM Just) timeout timeOut
-		result <- try $ tryTimeOut $ simpleHTTP $ insertHeader HdrUserAgent agent $ getRequest $ show u
+	setStdGen $ mkStdGen $ ctMin $ toUTCTime clockTime
+	manager <- newManager $ tlsManagerSettings {managerResponseTimeout = downloadMaximumTimeOut settings}
+	runRing urlChannel responseChannel $ \u -> do
+		case downloadMaximumSleepTime settings of
+			Nothing -> return ()
+			Just t' -> lift $ randomRIO (0, t') >>= threadDelay
+		initReq <- lift $ parseUrl $ show u
+		let req = initReq { method = methodGet,
+		                    requestHeaders = [(hUserAgent, S.pack $ downloadUserAgent settings)],
+		                    redirectCount = 0,
+		                    checkStatus = \_ _ _ -> Nothing }
+		lift $ log outputChannel $ "downloading " ++ (show u)
+		result <- lift $ try $ httpLbs req manager
+		lift $ result `seq` (log outputChannel $ "downloaded " ++ (show u))
 		case result of
-			Left err -> writeChan logChan ("network error\t" ++ (show u) ++ "\t" ++ (show (err :: SomeException)))
-			Right Nothing -> writeChan logChan ("timeout\t" ++ (show u)) >> writeChan urlChan u
-			Right (Just (Left err)) -> writeChan logChan ("network error\t" ++ (show u) ++ "\t" ++ (show (err :: ConnError)))
-			Right (Just (Right resp)) -> writeChan logChan ("download\t" ++ (show u)) >> writeChan responseChan (u, resp))
+			Left err -> lift $ log outputChannel $ "network error on " ++ (show u) ++ " with " ++ (show (err :: SomeException))
+			Right resp -> forward (u, resp)
+	closeManager manager
+	
 
 
+data ParserSettings = ParserSettings {
+	parserLoopRestrictions :: [(URI -> URI -> Bool)],
+	parserOutputs :: [ParserOutput],
+	parserFileCaching :: Maybe (String, String)}
+
+-- parser routine
+parser :: ParserSettings -> RingChan (URI, Response L.ByteString) -> RingChan Track -> OutputChan MyOutput -> IO ()
+parser settings responseChannel trackChannel outputChannel = runRing responseChannel trackChannel $ \(u, r) -> do
+	let convertURI s = parseURIReference s >>= \l -> return $ if uriIsRelative l then l `relativeTo` u else l
+	let headers = responseHeaders r
+	let contentType = lookup hContentType headers >>= return . S.unpack
+	let location = lookup hLocation headers >>= convertURI . S.unpack
+	let body = responseBody r
+	let status = responseStatus r
+	let code = statusCode status
+	let isCorrectContentType = maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
+	let doLooping l = all (\f -> f u l) $ parserLoopRestrictions settings
+	if statusIsRedirection status
+	then case location of
+	     	Nothing -> lift $ log outputChannel $ "http error on " ++ show u ++ " with code " ++ show code ++
+				                                      ": despite redirection no location given";
+				Just l -> do
+					when (doLooping l) (forward $ NewSeed l)
+					lift $ put outputChannel $ intercalate "\t" ["redirection", show u, show l, show code, fromMaybe "" $ getSuffix l]
+					lift $ put outputChannel $ intercalate "\t" ["visit", show u, fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
+					lift $ log outputChannel $ "parsed redirection " ++ show u
+	else if code == 200
+	then do
+		fileName <- case parserFileCaching settings of
+			Nothing -> return Nothing
+			Just (d, n) -> do
+				(filePath, handle) <- lift $ openTempFile d n
+				lift $ L.hPutStr handle body
+				lift $ hClose handle
+				return (Just filePath)
+		if isCorrectContentType
+		then do
+			let refs = parse (parserOutputs settings) u body
+		 	forwardList $ map NewSeed $ filter doLooping $ map fst refs
+		 	lift $ putList outputChannel $ map (\(l, t) -> intercalate "\t" $ ["reference", show u, show l] ++ (map L.unpack t)) refs
+		 	lift $ put outputChannel $ intercalate "\t" $ ["visit", show u] ++ (maybe [] return fileName) ++
+			                                              [fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
+			lift $ log outputChannel $ "parsed html document " ++ show u
+		else do
+			case (getSuffix u) of
+		 		Nothing -> return ();
+		 		Just s -> forward $ MarkInvalidType s
+			lift $ put outputChannel $ intercalate "\t" $ ["invalid type", show u] ++ (maybe [] return fileName) ++
+			                                              [fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
+			lift $ log outputChannel $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++ "\"" ++
+			                           " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
+	else lift $ log outputChannel $ "http error on " ++ show u ++ " with code " ++ show code ++ ":" ++ S.unpack (statusMessage status)
+	lift $ flushOutput outputChannel
 
 
-data ParseResult = HTTPError (Int, Int, Int) String | Redirection URI | InvalidType String | ParsedReferences [(URI, [String])]
-
-parse :: [(URI, Response String)] -> [(URI, ParseResult)]
-parse = map $ \(u, r) ->
-	let headers = rspHeaders r;
-	    contentType = lookupHeader HdrContentType headers;
-	    location = lookupHeader HdrLocation headers >>= parseURIReference;
-	    body = rspBody r;
-	    code = rspCode r;
-	    code2text (a,b,c) = show (a * 100 + b * 10 + c);
-	    eliminateData s
-	    	| null s = []
-	    	| "\"data:" `isPrefixOf` s = "\"" ++ (eliminateData $ dropWhile ('\"'/=) $ drop 6 s)
-	    	| "\'data:" `isPrefixOf` s = "\'" ++ (eliminateData $ dropWhile ('\''/=) $ drop 6 s)
-	    	| otherwise = [head s] ++ (eliminateData $ tail s);
-	    fromAnchorTag t = [fromAttrib "hreflang" t, fromAttrib "lang" t, fromAttrib "title" t];
-	    fromTextTags = map fromTagText . filter isTagText;
-	    fromImgTags = map (fromAttrib "alt") . filter (isTagOpenName "img");
-	    fromAnchor ts = let h = head ts; hs = takeWhile (~/= TagClose "a") ts
-	                    in (fromAttrib "href" h, fromAnchorTag h ++ fromTextTags hs ++ fromImgTags hs);
-	    getAnchors = map fromAnchor . partitions (isTagOpenName "a");
-	    getLinks = map (\t -> (fromAttrib "href" t, [fromAttrib "hreflang" t])) . filter (~== "<link rel=alternate>");
-	    canonicalizeURI v = URI (uriScheme v) (uriAuthority v) (if null $ uriPath v then "/" else uriPath v) (uriQuery v) "";
-	    convertURI s = parseURIReference s >>= return . canonicalizeURI . (\z -> maybe (relativeTo z u) (const z) (uriAuthority z));
-	    getReferences ts = mapMaybe (\(v, t) -> maybe Nothing (\z -> Just (z, t)) $ convertURI v) $ getAnchors ts ++ getLinks ts;
-	    isCorrectContentType = maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
-	in if isCorrectContentType
-		then case code of 
-			(3,_,_) -> (u, maybe (HTTPError code "despite redirection no location given") Redirection location)
-			(2,0,0) -> (u, ParsedReferences $ getReferences $ canonicalizeTags $ parseTags $ eliminateData body)
-			_ -> (u, HTTPError code $ "code " ++ (code2text code))
-		else (u, InvalidType $ maybe "" id contentType)
-
-parser :: Bool -> Chan (URI, Response String) -> Chan String -> Chan String -> Chan Track -> IO ()
-parser loopBack respChan outputChan logChan trackChan =
-	let code2text (a,b,c) = show $ a * 100 + b * 10 + c;
-	    reportPageVisit u = writeChan logChan $ "visit\t" ++ (show u);
-	    reportInvalidType u m = writeChan logChan $ "invalid type\t" ++ (show u) ++ "\t" ++ m;
-	    markPageVisit u = writeChan outputChan $ "visit\t" ++ (show u);
-	    markReferences h = writeList2Chan outputChan . map (\(l, t) -> "reference\t"++(show h) ++"\t" ++ (show l) ++ "\t" ++ (unwords t));
-	    markRedirection h l = writeChan outputChan $ "redirection\t" ++ (show h) ++ "\t" ++ (show l);
-	    pushi = writeChan trackChan . MarkInvalidType;
-	    push = writeChan trackChan . NewSeed;
-	    pushs = writeList2Chan trackChan . map (NewSeed . fst);
-	    handle (u, HTTPError c reason) = writeChan logChan $ "http error\t" ++ (show u) ++ "\t" ++ (code2text c) ++ "\t" ++ reason;
-	    handle (u, Redirection loc) = markRedirection u loc >> markPageVisit u >> reportPageVisit u >> when loopBack (push loc);
-	    handle (u, InvalidType mime) = reportInvalidType u mime >> maybe mzero pushi (getSuffix u);
-	    handle (u, ParsedReferences refs) = markReferences u refs >> markPageVisit u >> reportPageVisit u >> when loopBack (pushs refs);
-	in getChanContents respChan >>= return . parse >>= mapM'_ handle
-
-
-
-
+-- track objects
 data Track = NewSeed URI | MarkInvalidType String
 
-tracker :: Set String -> Set URI -> Chan Track -> Chan URI -> IO ()
-tracker badSuffixes history trackChan urlChan = 
-	let handle :: (Set String, Set URI) -> Track -> IO (Set String, Set URI)
-	    handle (b, h) (NewSeed u) = if member u h
-			                            	then return (b, h)
-	                                	else if maybe False (flip member b) $ getSuffix u
-										                     	then return (b, h)
-	    				                           	else writeChan urlChan u >> return (b, Data.Set.insert u h)
-	    handle (b, h) (MarkInvalidType suffix) = return (Data.Set.insert suffix b, h)
-	in getChanContents trackChan >>= foldM_ handle (badSuffixes, history)
+-- keeps track of visited web pages, invalid type suffixes and robots texts
+tracker :: Set String -> Set String -> Set URI -> String -> RingChan Track -> RingChan URI -> OutputChan MyOutput -> IO ()
+tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputChannel
+	= void $ runRingS trackChannel urlChannel (badSuffixes, history, []) $ \ (s, h, r) t -> do
+	  case t of
+	  	MarkInvalidType o -> do
+				if member o goodSuffixes
+				then do
+					lift $ log outputChannel $ "suffix \"" ++ o ++ "\" indicates invalid type but is part of good suffixes!"
+					return (s, h, r)
+				else do
+		  		lift $ log outputChannel $ "add suffix \"" ++ o ++ "\" to invalid type suffixes"
+		  		return (Data.Set.insert o s, h, r)
+	  	NewSeed u -> do
+	  		let suffix = getSuffix u
+	  		if member u h
+	  		then return (s, h, r)
+	  		else if fromMaybe False $ fmap (flip member s) suffix
+	  		     then do
+						 	lift $ log outputChannel $ "url \"" ++ show u ++ "\" contains suffix \"" ++ fromMaybe "" suffix ++
+							                           "\" indicating invalid type document"
+						 	return (s, h, r)
+	  		     else do
+	  		     	let maybeDomain = uriAuthority u >>= return . uriRegName
+	  		     	case maybeDomain of
+	  		     		Nothing -> do
+	  		     			lift $ log outputChannel $ "url \"" ++ show u ++ "\" is missing a domain specification and will be discarded!"
+	  		     			return (s, h, r)
+	  		     		Just domain -> do
+	  		     			(specRobots, newAllRobots) <- case lookup domain r of
+	  		     				Just robots -> return (robots, r)
+	  		     				Nothing -> do
+	  		     					lift $ log outputChannel $ "miss robots for domain " ++ domain
+	  		     					let v = u {uriPath = "/robots.txt", uriQuery = "", uriFragment = ""}
+	  		     					lift $ log outputChannel $ "downloading robots from " ++ show v
+	  		     					initReq <- lift $ parseUrl $ show v
+	  		     					let req = initReq {method = methodGet, redirectCount = 10}
+	  		     					manager <- lift $ newManager $ tlsManagerSettings {managerResponseTimeout = Just 10000000}
+	  		     					result <- lift $ try $ httpLbs req manager
+	  		     					case result of
+	  		     						Left err -> do
+	  		     							lift $ log outputChannel $ "network error on " ++ show v ++ ":" ++ (show (err :: SomeException))
+	  		     							return (makeEmptyRobots, (domain, makeEmptyRobots) : r)
+	  		     						Right resp -> do
+	  		     							lift $ log outputChannel $ "downloaded robots from " ++ show v
+	  		     							let newRobots = makeRobots agent $ L.unpack $ responseBody resp
+	  		     							return (newRobots, (domain, newRobots) : r)
+	  		     			if isRobotsConform specRobots u
+	  		     			then forward u >> return (s, Data.Set.insert u h, newAllRobots)
+	  		     			else do
+	  		     				lift $ log outputChannel $ "robots discards " ++ (show u)
+	  		     				return (s, h, newAllRobots)
 
 
-
-
-
-data Flag = Help | Looping Bool | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int | Parsers Int | BadSuffixes FilePath |
-            Histories FilePath | BadSuffix String | History String | SyncOutput
+data Flag = Help | LoopRestriction (URI -> URI -> Bool) | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int |
+            BadSuffixes FilePath | Histories FilePath | BadSuffix String | History String | SyncOutput |
+						Pattern ParserOutput | FileCaching String | ReadFromStdInput | GoodSuffixes FilePath | GoodSuffix String
 
 options :: [OptDescr Flag]
 options = [
 	Option "" ["help"] (NoArg Help) "shows this text",
-	Option "l" ["looping"] (NoArg $ Looping True) "crawl all references which are encountered",
-	Option "" ["no-looping"] (NoArg $ Looping False) "crawl only web pages given as seeds",
+	Option "" ["no-looping"] (NoArg $ LoopRestriction $ \_ _ -> False) "crawl only web pages given as seeds",
+	Option "" ["stay-in-domain"] (NoArg $ LoopRestriction isSameDomain) "put only web pages in loop which where reached from same domain",
 	Option "u" ["user-agent"] (ReqArg (\s -> UserAgent s) "STRING")
 		"STRING is used as user agent identification and should contain the word bot as well as some conctact address for emergency cases",
 	Option "t" ["timeout"] (ReqArg (\s -> MaxTimeOut $ read s) "MICROSECONDS")
 		"wait at most MICROSECONDS for every download request",
 	Option "ws" ["waiting-time", "sleep-time"] (ReqArg (\s -> MaxWaitingTime $ read s) "MICROSECONDS")
 		"wait between zero and MICROSECONDS before starting the next download request",
-	Option "p" ["parsers"] (ReqArg (\s -> Parsers $ read s) "AMOUNT") "AMOUNT parser threads will be started",
 	Option "" ["bad-suffixes"] (ReqArg (\s -> BadSuffixes s) "FILE") "FILE contains list of suffixes which indicate no html resources",
+	Option "" ["good-suffixes"] (ReqArg (\s -> GoodSuffixes s) "FILE") "FILE contains list of suffixes which indicates html resources",
 	Option "" ["histories"] (ReqArg (\s -> Histories s) "FILE") "FILE contains urls which were already visited",
 	Option "b" ["bad-suffix"] (ReqArg (\s -> BadSuffix s) "SUFFIX") "SUFFIX indicates no html resource",
+	Option "g" ["good-suffix"] (ReqArg (\s -> GoodSuffix s) "SUFFIX") "SUFFIX indicates html resource",
 	Option "h" ["history"] (ReqArg (\s -> History s) "URL") "URL is considered to be already visited",
-	Option "" ["sync-output"] (NoArg SyncOutput) "synchronises output and log messages"]
+	Option "" ["sync-output"] (NoArg SyncOutput) "synchronises output and log messages",
+	Option "" ["print-precontext"] (OptArg (\x -> Pattern $ PreContext (fmap read x) (switchMaybe "div" x)) "NUMBER")
+		"prints NUMBERs words of text context before the reference; if called without a number it is limited to div tag areas",
+	Option "" ["print-postcontext"] (OptArg (\x -> Pattern $ PostContext (fmap read x) (switchMaybe "div" x)) "NUMBER")
+		"prints NUMBERs words of text context after the reference; if called without a number it is limited to div tag areas",
+	Option "" ["print-text"] (NoArg $ Pattern ReferenceText) "prints text of reference",
+	Option "" ["print-attribute"] (ReqArg (Pattern . ReferenceAttribute) "NAME") "prints value of attribute NAME of the reference tag",
+	Option "" ["print-embedded-img-attribute"] (ReqArg (Pattern . EmbeddedImageAttribute) "NAME")
+		"prints value of attribute NAME of any embedded image tag in the reference area",
+	Option "" ["print-name"] (NoArg $ Pattern ReferenceName) "prints name of the reference tag",
+	Option "" ["print-ref-suffix"] (NoArg $ Pattern ReferenceSuffix) "prints suffix of reference",
+	Option "" ["cache-file"] (ReqArg FileCaching "FILE") "caches crawled resources to some files according to the template FILE",
+	Option "" ["read-input"] (NoArg ReadFromStdInput) "reads urls to crawl also from standard input"]
 
 
 main :: IO ()
 main = do
-	(originSeeds, doLooping, userAgent, timeOut, sleepTime, parserN, badSuffixes, history, syncOutput) <- getArgs >>= (\args ->
+	(originSeeds, loopRestrictions, userAgent, timeOut, sleepTime, badSuffixes, goodSuffixes, history,
+		patterns, fileCaching, readStdInput) <- getArgs >>= (\args ->
 		case getOpt Permute options args of
 			(o,n,[]) -> do
 				let needHelp = any (\f -> case f of {Help->True;_->False}) o
@@ -167,14 +291,16 @@ main = do
 					exitSuccess
 				let (invalidSeeds, validSeeds) = partitionEithers $ map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) n
 				mapM_ (\s -> hPutStrLn stderr $ "invalid absolute uri \"" ++ s ++ "\" will be ignored!") invalidSeeds
-				let doLooping = or $ mapMaybe (\f -> case f of {(Looping b)->Just b;_->Nothing}) o
+				let loopRestrictions = [\_ _ -> True] ++ mapMaybe (\f -> case f of {(LoopRestriction p)->Just p;_->Nothing}) o
 				let userAgent = maybe "webcrawler bot" id $ listToMaybe $ mapMaybe (\f -> case f of {(UserAgent s)->Just s;_->Nothing}) o
 				let timeOut = listToMaybe $ mapMaybe (\f->case f of {(MaxTimeOut z)->Just z;_->Nothing}) o
 				let sleepTime = listToMaybe $ mapMaybe (\f->case f of {(MaxWaitingTime z)->Just z;_->Nothing}) o
-				let parserN = maybe 1 id $ listToMaybe $ mapMaybe (\f->case f of {(Parsers z)->Just z;_->Nothing}) o
 				let badSuffixes = mapMaybe (\f->case f of {(BadSuffix s)->Just s;_->Nothing}) o
 				let badSuffixFiles = mapMaybe (\f -> case f of {(BadSuffixes s)->Just s; _->Nothing}) o
+				let goodSuffixes = mapMaybe (\f -> case f of {(GoodSuffix s) -> Just s; _ -> Nothing}) o
+				let goodSuffixFiles = mapMaybe (\f -> case f of {(GoodSuffixes s) -> Just s; _ -> Nothing}) o
 				badSuffixFilesContents <- mapM readFile badSuffixFiles >>= return . concat . map lines
+				goodSuffixFilesContents <- mapM readFile goodSuffixFiles >>= return . concat . map lines
 				let (invalidHistories, validHistories) = partitionEithers $ map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) $
 					mapMaybe (\f -> case f of {(History s) -> Just s; _ -> Nothing}) o
 				let historyFiles = mapMaybe (\f -> case f of {(Histories s) -> Just s; _ -> Nothing}) o
@@ -183,32 +309,67 @@ main = do
 				let (invalidHFC, validHFC) = partitionEithers historyFilesContents
 				mapM_ (\s -> hPutStrLn stderr $ "invalid absolute uri \"" ++ s ++ "\" in history will be ignored!") $
 					invalidHistories ++ invalidHFC
-				let syncOutput = any (\f -> case f of {SyncOutput->True;_->False}) o
-				return (validSeeds, doLooping, userAgent, timeOut, sleepTime, parserN,
+				let patterns = mapMaybe (\f -> case f of {(Pattern p)->Just p;_->Nothing}) o
+				let splitFilePattern = (\(a,b) -> (reverse b, reverse a)) . span ('/'/=) . reverse
+				let fileCaching = (listToMaybe $ mapMaybe (\f -> case f of {(FileCaching z)->Just z;_->Nothing}) o) >>=
+				                  	(return . splitFilePattern)
+				let readFromInput = any (\f -> case f of {ReadFromStdInput->True;_->False}) o
+				return (validSeeds, loopRestrictions, userAgent, timeOut, sleepTime,
 				        fromList $ badSuffixes ++ badSuffixFilesContents,
-				        fromList $ validHistories ++ validHFC, syncOutput)
+								fromList $ goodSuffixes ++ goodSuffixFilesContents,
+				        fromList $ validHistories ++ validHFC, patterns, fileCaching, readFromInput)
 			(_,_,errs) -> ioError (userError (concat errs ++ usageInfo "usage: crawler [OPTION ...] urls..." options)))
-	seedChan <- newChan
-	logChan <- newChan
-	respChan <- newChan
-	outputChan <- newChan
-	trackChan <- newChan
-	finisher <- newQSemN $ 0	
-	let completeLogMessage l c = (showTimeStamp c) ++ "\t" ++ l
-	logThread <- forkIO (getChanContents logChan >>= mapM_ (\l -> getClockTime >>=
-		(if syncOutput then writeChan outputChan else hPutStrLn stderr) . completeLogMessage l) >> signalQSemN finisher 1)
-	downloadThread <- forkIO (writeChan logChan "started download thread" >>
-		downloader sleepTime timeOut userAgent seedChan respChan logChan >> signalQSemN finisher 1)
---	parserThreads <- replicateM parserN $ forkIO ( writeChan logChan "started parser thread" >>
-	parserThreads <- forkIO ( writeChan logChan "started parser thread" >>
-		parser doLooping respChan outputChan logChan trackChan >> signalQSemN finisher 1)
-	trackerThread <- forkIO ( writeChan logChan "started tracker thread" >>
-		tracker badSuffixes history trackChan seedChan >> signalQSemN finisher 1)
-	outputThread <- forkIO ( writeChan logChan "started output thread" >>
-		getChanContents outputChan >>= mapM_ putStrLn >> signalQSemN finisher 1)
-	writeList2Chan seedChan originSeeds
-	getContents >>= return . map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) . lines >>= mapM_ (\t ->
-		case t of
-			Left s -> hPutStrLn stderr $ "invalid absolute uri \"" ++ s ++ "\" will be ignored!"
-			Right u -> writeChan seedChan u)
-	waitQSemN finisher $ 4 + parserN
+	seedChannel <- newChan
+	responseChannel <- newChan
+	outputChannel <- newChan
+	trackChannel <- newChan
+	-- download thread
+	void $ forkIO $ do
+		log outputChannel "download thread started"
+		let downloadSettings = DownloadSettings{
+				downloadMaximumSleepTime = sleepTime,
+				downloadMaximumTimeOut = timeOut,
+				downloadUserAgent = userAgent}
+		downloadResult <- try $ downloader downloadSettings seedChannel responseChannel outputChannel
+		case downloadResult of
+			Left e -> error $ "download thread: exception " ++ show (e :: SomeException)
+			Right _ -> log outputChannel "download thread stopped"
+		closeOutputChan outputChannel
+	-- parser thread
+	void $ forkIO $ do
+		log outputChannel "parser thread started"
+		let parserSettings = ParserSettings {
+			parserFileCaching = fileCaching,
+			parserOutputs = patterns,
+			parserLoopRestrictions = loopRestrictions}
+		parserResult <- try $ parser parserSettings responseChannel trackChannel outputChannel
+		case parserResult of
+			Left e -> error $ "parser thread: exception " ++ show (e :: SomeException)
+			Right _ -> log outputChannel "parser thread stopped"
+		closeOutputChan outputChannel
+	-- tracker thread
+	void $ forkIO $ do
+		log outputChannel "tracker thread started"
+		trackerResult <- try $ tracker goodSuffixes badSuffixes history userAgent trackChannel seedChannel outputChannel
+		case trackerResult of
+			Left e -> error $ "tracker thread: exception " ++ show (e :: SomeException)
+			Right _ -> log outputChannel "tracker thread stopped"
+		closeOutputChan outputChannel
+	-- stream into track channel
+	writeListRingChan trackChannel $ map NewSeed originSeeds
+	-- input thread
+	when readStdInput $ void $ forkIO $ do
+		getContents >>= return . map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) . lines >>= mapM_ (\t -> case t of
+			Left s -> log outputChannel $ "invalid absolute uri \"" ++ s ++ "\" will be ignored!"
+			Right u -> writeRingChan trackChannel $ NewSeed u)
+		closeOutputChan outputChannel
+		signalLastRingChan trackChannel
+	-- in case we dont read from standard input we have to give here
+	-- an exta signal for the situation that no new url is coming in
+	-- into the ring pipe from the outside
+	when (not readStdInput) (signalLastRingChan trackChannel)
+	-- output thread is on main thread since it indirectly synchronises all threads
+	runOutput outputChannel (3 + (if readStdInput then 1 else 0)) $ \t -> case t of
+		StdOut m -> hPutStrLn stdout m;
+		StdErr m -> hPutStrLn stderr m >> hFlush stderr;
+		StdOutFlush -> hFlush stdout
