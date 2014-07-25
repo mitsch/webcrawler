@@ -116,9 +116,7 @@ downloader settings urlChannel responseChannel trackChannel outputChannel = do
 	manager <- newManager $ tlsManagerSettings {managerResponseTimeout = downloadMaximumTimeOut settings}
 	void $ runRingS urlChannel responseChannel (downloadBadSuffixes settings) $ \ badSuffixes u -> do
 		let suffix = getSuffix u
-		let isBadSuffix = fmap (flip elem badSuffixes) suffix
-		let isGoodSuffix = fmap (flip elem (downloadGoodSuffixes settings)) suffix
-		if fromMaybe True $ isGoodSuffix `mplus` (fmap not isBadSuffix)
+		if fromMaybe True $ fmap (\s -> s `elem` (downloadGoodSuffixes settings) || s `notElem` badSuffixes) suffix
 		then do
 			case downloadMaximumSleepTime settings of
 				Nothing -> return ()
