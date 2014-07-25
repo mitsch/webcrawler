@@ -104,29 +104,53 @@ flushOutput c = writeOutputChan c StdOutFlush
 data DownloadSettings = DownloadSettings {
 	downloadMaximumSleepTime :: Maybe Int,
 	downloadMaximumTimeOut :: Maybe Int,
-	downloadUserAgent :: String}
+	downloadUserAgent :: String,
+	downloadBadSuffixes :: [String],
+	downloadGoodSuffixes :: [String]}
 
 -- downloader routine
-downloader :: DownloadSettings -> RingChan URI -> RingChan (URI, Response L.ByteString) -> OutputChan MyOutput -> IO ()
-downloader settings urlChannel responseChannel outputChannel = do
+downloader :: DownloadSettings -> RingChan URI -> RingChan (URI, Response L.ByteString) -> RingChan Track -> OutputChan MyOutput -> IO ()
+downloader settings urlChannel responseChannel trackChannel outputChannel = do
 	clockTime <- getClockTime
 	setStdGen $ mkStdGen $ ctMin $ toUTCTime clockTime
 	manager <- newManager $ tlsManagerSettings {managerResponseTimeout = downloadMaximumTimeOut settings}
-	runRing urlChannel responseChannel $ \u -> do
-		case downloadMaximumSleepTime settings of
-			Nothing -> return ()
-			Just t' -> lift $ randomRIO (0, t') >>= threadDelay
-		initReq <- lift $ parseUrl $ show u
-		let req = initReq { method = methodGet,
-		                    requestHeaders = [(hUserAgent, S.pack $ downloadUserAgent settings)],
-		                    redirectCount = 0,
-		                    checkStatus = \_ _ _ -> Nothing }
-		lift $ log outputChannel $ "downloading " ++ (show u)
-		result <- lift $ try $ httpLbs req manager
-		lift $ result `seq` (log outputChannel $ "downloaded " ++ (show u))
-		case result of
-			Left err -> lift $ log outputChannel $ "network error on " ++ (show u) ++ " with " ++ (show (err :: SomeException))
-			Right resp -> forward (u, resp)
+	void $ runRingS urlChannel responseChannel (downloadBadSuffixes settings) $ \ badSuffixes u -> do
+		let suffix = getSuffix u
+		let isBadSuffix = fmap (flip elem badSuffixes) suffix
+		let isGoodSuffix = fmap (flip elem (downloadGoodSuffixes settings)) suffix
+		if fromMaybe True $ isGoodSuffix `mplus` (fmap not isBadSuffix)
+		then do
+			case downloadMaximumSleepTime settings of
+				Nothing -> return ()
+				Just t' -> lift $ randomRIO (0, t') >>= threadDelay
+			initReq <- lift $ parseUrl $ show u
+			let req = initReq { method = methodGet,
+			                    requestHeaders = [(hUserAgent, S.pack $ downloadUserAgent settings)],
+			                    redirectCount = 0,
+			                    checkStatus = \_ _ _ -> Nothing }
+			lift $ log outputChannel $ "downloading " ++ (show u)
+			result <- lift $ try $ httpLbs req manager
+			case result of
+				Left err -> do
+					lift $ log outputChannel $ "network error on " ++ (show u) ++ " with " ++ (show (err :: SomeException))
+					return badSuffixes
+				Right resp -> do
+					let headers = responseHeaders resp
+					let contentType = lookup hContentType headers >>= return . S.unpack
+					if maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
+					then forward (u, resp) >> return badSuffixes
+					else do
+						lift $ put outputChannel $ intercalate "\t" $ ["invalid type", show u, "", fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
+						lift $ log outputChannel $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++ "\"" ++
+						                           " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
+						case mfilter (not . flip elem (downloadGoodSuffixes settings)) suffix of
+							Nothing -> return badSuffixes
+							Just s -> do
+								lift $ writeRingChan trackChannel $ MarkInvalidType s
+								return $ s : badSuffixes
+		else do
+			lift $ log outputChannel $ "url \"" ++ show u ++ "\" contains suffix \"" ++ fromMaybe "" suffix ++ "\" indicating invalid type document"
+			return badSuffixes
 	closeManager manager
 	
 
@@ -141,12 +165,10 @@ parser :: ParserSettings -> RingChan (URI, Response L.ByteString) -> RingChan Tr
 parser settings responseChannel trackChannel outputChannel = runRing responseChannel trackChannel $ \(u, r) -> do
 	let convertURI s = parseURIReference s >>= \l -> return $ if uriIsRelative l then l `relativeTo` u else l
 	let headers = responseHeaders r
-	let contentType = lookup hContentType headers >>= return . S.unpack
 	let location = lookup hLocation headers >>= convertURI . S.unpack
 	let body = responseBody r
 	let status = responseStatus r
 	let code = statusCode status
-	let isCorrectContentType = maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
 	let doLooping l = all (\f -> f u l) $ parserLoopRestrictions settings
 	if statusIsRedirection status
 	then case location of
@@ -155,7 +177,7 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 				Just l -> do
 					when (doLooping l) (forward $ NewSeed l)
 					lift $ put outputChannel $ intercalate "\t" ["redirection", show u, show l, show code, fromMaybe "" $ getSuffix l]
-					lift $ put outputChannel $ intercalate "\t" ["visit", show u, fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
+					lift $ put outputChannel $ intercalate "\t" ["visit", show u, fromMaybe "" $ getSuffix u, ""]
 					lift $ log outputChannel $ "parsed redirection " ++ show u
 	else if code == 200
 	then do
@@ -166,22 +188,12 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 				lift $ L.hPutStr handle body
 				lift $ hClose handle
 				return (Just filePath)
-		if isCorrectContentType
-		then do
-			let refs = parse (parserOutputs settings) u body
-		 	forwardList $ map NewSeed $ filter doLooping $ map fst refs
-		 	lift $ putList outputChannel $ map (\(l, t) -> intercalate "\t" $ ["reference", show u, show l] ++ (map L.unpack t)) refs
-		 	lift $ put outputChannel $ intercalate "\t" $ ["visit", show u] ++ (maybe [] return fileName) ++
-			                                              [fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
-			lift $ log outputChannel $ "parsed html document " ++ show u
-		else do
-			case (getSuffix u) of
-		 		Nothing -> return ();
-		 		Just s -> forward $ MarkInvalidType s
-			lift $ put outputChannel $ intercalate "\t" $ ["invalid type", show u] ++ (maybe [] return fileName) ++
-			                                              [fromMaybe "" $ getSuffix u, fromMaybe "" contentType]
-			lift $ log outputChannel $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++ "\"" ++
-			                           " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
+		let refs = parse (parserOutputs settings) u body
+		forwardList $ map NewSeed $ filter doLooping $ map fst refs
+		lift $ putList outputChannel $ map (\(l, t) -> intercalate "\t" $ ["reference", show u, show l] ++ (map L.unpack t)) refs
+		lift $ put outputChannel $ intercalate "\t" $ ["visit", show u] ++ (maybe [] return fileName) ++
+		                                              [fromMaybe "" $ getSuffix u, ""]
+		lift $ log outputChannel $ "parsed html document " ++ show u
 	else lift $ log outputChannel $ "http error on " ++ show u ++ " with code " ++ show code ++ ":" ++ S.unpack (statusMessage status)
 	lift $ flushOutput outputChannel
 
@@ -190,57 +202,57 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 data Track = NewSeed URI | MarkInvalidType String
 
 -- keeps track of visited web pages, invalid type suffixes and robots texts
-tracker :: Set String -> Set String -> Set URI -> String -> RingChan Track -> RingChan URI -> OutputChan MyOutput -> IO ()
+tracker :: [String] -> [String] -> Set URI -> String -> RingChan Track -> RingChan URI -> OutputChan MyOutput -> IO ()
 tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputChannel
 	= void $ runRingS trackChannel urlChannel (badSuffixes, history, []) $ \ (s, h, r) t -> do
-	  case t of
-	  	MarkInvalidType o -> do
-				if member o goodSuffixes
+	  	case t of
+	  		MarkInvalidType o -> do
+				if elem o goodSuffixes
 				then do
 					lift $ log outputChannel $ "suffix \"" ++ o ++ "\" indicates invalid type but is part of good suffixes!"
 					return (s, h, r)
 				else do
-		  		lift $ log outputChannel $ "add suffix \"" ++ o ++ "\" to invalid type suffixes"
-		  		return (Data.Set.insert o s, h, r)
-	  	NewSeed u -> do
-	  		let suffix = getSuffix u
-	  		if member u h
-	  		then return (s, h, r)
-	  		else if fromMaybe False $ fmap (flip member s) suffix
-	  		     then do
-						 	lift $ log outputChannel $ "url \"" ++ show u ++ "\" contains suffix \"" ++ fromMaybe "" suffix ++
-							                           "\" indicating invalid type document"
-						 	return (s, h, r)
-	  		     else do
-	  		     	let maybeDomain = uriAuthority u >>= return . uriRegName
-	  		     	case maybeDomain of
-	  		     		Nothing -> do
-	  		     			lift $ log outputChannel $ "url \"" ++ show u ++ "\" is missing a domain specification and will be discarded!"
-	  		     			return (s, h, r)
-	  		     		Just domain -> do
-	  		     			(specRobots, newAllRobots) <- case lookup domain r of
-	  		     				Just robots -> return (robots, r)
-	  		     				Nothing -> do
-	  		     					lift $ log outputChannel $ "miss robots for domain " ++ domain
-	  		     					let v = u {uriPath = "/robots.txt", uriQuery = "", uriFragment = ""}
-	  		     					lift $ log outputChannel $ "downloading robots from " ++ show v
-	  		     					initReq <- lift $ parseUrl $ show v
-	  		     					let req = initReq {method = methodGet, redirectCount = 10}
-	  		     					manager <- lift $ newManager $ tlsManagerSettings {managerResponseTimeout = Just 10000000}
-	  		     					result <- lift $ try $ httpLbs req manager
-	  		     					case result of
-	  		     						Left err -> do
-	  		     							lift $ log outputChannel $ "network error on " ++ show v ++ ":" ++ (show (err :: SomeException))
-	  		     							return (makeEmptyRobots, (domain, makeEmptyRobots) : r)
-	  		     						Right resp -> do
-	  		     							lift $ log outputChannel $ "downloaded robots from " ++ show v
-	  		     							let newRobots = makeRobots agent $ L.unpack $ responseBody resp
-	  		     							return (newRobots, (domain, newRobots) : r)
-	  		     			if isRobotsConform specRobots u
-	  		     			then forward u >> return (s, Data.Set.insert u h, newAllRobots)
-	  		     			else do
-	  		     				lift $ log outputChannel $ "robots discards " ++ (show u)
-	  		     				return (s, h, newAllRobots)
+	  				lift $ log outputChannel $ "add suffix \"" ++ o ++ "\" to invalid type suffixes"
+	  				return (o : s, h, r)
+	  		NewSeed u -> do
+	  			let suffix = getSuffix u
+	  			if member u h
+	  			then return (s, h, r)
+	  			else if fromMaybe False $ fmap (flip elem s) suffix
+	  			     then do
+	  			     	lift $ log outputChannel $ "url \"" ++ show u ++ "\" contains suffix \"" ++ fromMaybe "" suffix ++
+	  			     	                           "\" indicating invalid type document"
+	  			     	return (s, h, r)
+	  		         else do
+	  		         	let maybeDomain = uriAuthority u >>= return . uriRegName
+	  		         	case maybeDomain of
+	  		         		Nothing -> do
+	  		         			lift $ log outputChannel $ "url \"" ++ show u ++ "\" is missing a domain specification and will be discarded!"
+	  		         			return (s, h, r)
+	  		         		Just domain -> do
+	  		         			(specRobots, newAllRobots) <- case lookup domain r of
+	  		         				Just robots -> return (robots, r)
+	  		         				Nothing -> do
+	  		         					lift $ log outputChannel $ "miss robots for domain " ++ domain
+	  		         					let v = u {uriPath = "/robots.txt", uriQuery = "", uriFragment = ""}
+	  		         					lift $ log outputChannel $ "downloading robots from " ++ show v
+	  		         					initReq <- lift $ parseUrl $ show v
+	  		         					let req = initReq {method = methodGet, redirectCount = 10}
+	  		         					manager <- lift $ newManager $ tlsManagerSettings {managerResponseTimeout = Just 10000000}
+	  		         					result <- lift $ try $ httpLbs req manager
+	  		         					case result of
+	  		         						Left err -> do
+	  		         							lift $ log outputChannel $ "network error on " ++ show v ++ ":" ++ (show (err :: SomeException))
+	  		         							return (makeEmptyRobots, (domain, makeEmptyRobots) : r)
+	  		         						Right resp -> do
+	  		         							lift $ log outputChannel $ "downloaded robots from " ++ show v
+	  		         							let newRobots = makeRobots agent $ L.unpack $ responseBody resp
+	  		         							return (newRobots, (domain, newRobots) : r)
+	  		         			if isRobotsConform specRobots u
+	  		         			then forward u >> return (s, Data.Set.insert u h, newAllRobots)
+	  		         			else do
+	  		         				lift $ log outputChannel $ "robots discards " ++ (show u)
+	  		         				return (s, h, newAllRobots)
 
 
 data Flag = Help | LoopRestriction (URI -> URI -> Bool) | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int |
@@ -315,8 +327,7 @@ main = do
 				                  	(return . splitFilePattern)
 				let readFromInput = any (\f -> case f of {ReadFromStdInput->True;_->False}) o
 				return (validSeeds, loopRestrictions, userAgent, timeOut, sleepTime,
-				        fromList $ badSuffixes ++ badSuffixFilesContents,
-								fromList $ goodSuffixes ++ goodSuffixFilesContents,
+				        badSuffixes ++ badSuffixFilesContents, goodSuffixes ++ goodSuffixFilesContents,
 				        fromList $ validHistories ++ validHFC, patterns, fileCaching, readFromInput)
 			(_,_,errs) -> ioError (userError (concat errs ++ usageInfo "usage: crawler [OPTION ...] urls..." options)))
 	seedChannel <- newChan
@@ -329,8 +340,10 @@ main = do
 		let downloadSettings = DownloadSettings{
 				downloadMaximumSleepTime = sleepTime,
 				downloadMaximumTimeOut = timeOut,
-				downloadUserAgent = userAgent}
-		downloadResult <- try $ downloader downloadSettings seedChannel responseChannel outputChannel
+				downloadUserAgent = userAgent,
+				downloadBadSuffixes = badSuffixes,
+				downloadGoodSuffixes = goodSuffixes}
+		downloadResult <- try $ downloader downloadSettings seedChannel responseChannel trackChannel outputChannel
 		case downloadResult of
 			Left e -> error $ "download thread: exception " ++ show (e :: SomeException)
 			Right _ -> log outputChannel "download thread stopped"
