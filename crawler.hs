@@ -200,7 +200,7 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 data Track = NewSeed URI | MarkInvalidType String
 
 -- keeps track of visited web pages, invalid type suffixes and robots texts
-tracker :: [String] -> [String] -> Set URI -> String -> RingChan Track -> RingChan URI -> OutputChan MyOutput -> IO ()
+tracker :: [String] -> [String] -> Set S.ByteString -> String -> RingChan Track -> RingChan URI -> OutputChan MyOutput -> IO ()
 tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputChannel
 	= void $ runRingS trackChannel urlChannel (badSuffixes, history, []) $ \ (s, h, r) t -> do
 	  	case t of
@@ -214,7 +214,8 @@ tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputCha
 	  				return (o : s, h, r)
 	  		NewSeed u -> do
 	  			let suffix = getSuffix u
-	  			if member u h
+				let uT = S.pack $ show u
+	  			if member uT h
 	  			then return (s, h, r)
 	  			else if fromMaybe False $ fmap (flip elem s) suffix
 	  			     then do
@@ -247,7 +248,7 @@ tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputCha
 	  		         							let newRobots = makeRobots agent $ L.unpack $ responseBody resp
 	  		         							return (newRobots, (domain, newRobots) : r)
 	  		         			if isRobotsConform specRobots u
-	  		         			then forward u >> return (s, Data.Set.insert u h, newAllRobots)
+	  		         			then forward u >> return (s, Data.Set.insert uT h, newAllRobots)
 	  		         			else do
 	  		         				lift $ log outputChannel $ "robots discards " ++ (show u)
 	  		         				return (s, h, newAllRobots)
