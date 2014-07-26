@@ -161,7 +161,7 @@ data ParserSettings = ParserSettings {
 -- parser routine
 parser :: ParserSettings -> RingChan (URI, Response L.ByteString) -> RingChan Track -> OutputChan MyOutput -> IO ()
 parser settings responseChannel trackChannel outputChannel = runRing responseChannel trackChannel $ \(u, r) -> do
-	let convertURI s = parseURIReference s >>= \l -> return $ if uriIsRelative l then l `relativeTo` u else l
+	let convertURI s = parseURIReference s >>= \l -> return $ fromMaybe l $ l`relativeTo` u
 	let headers = responseHeaders r
 	let location = lookup hLocation headers >>= convertURI . S.unpack
 	let body = responseBody r
