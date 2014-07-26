@@ -327,7 +327,7 @@ main = do
 				let readFromInput = any (\f -> case f of {ReadFromStdInput->True;_->False}) o
 				return (validSeeds, loopRestrictions, userAgent, timeOut, sleepTime,
 				        badSuffixes ++ badSuffixFilesContents, goodSuffixes ++ goodSuffixFilesContents,
-				        fromList $ validHistories ++ validHFC, patterns, fileCaching, readFromInput)
+				        fromList $ map (S.pack . show) $ validHistories ++ validHFC, patterns, fileCaching, readFromInput)
 			(_,_,errs) -> ioError (userError (concat errs ++ usageInfo "usage: crawler [OPTION ...] urls..." options)))
 	seedChannel <- newChan
 	responseChannel <- newChan
