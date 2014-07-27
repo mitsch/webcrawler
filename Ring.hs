@@ -70,9 +70,10 @@ instance (Monad m) => Monad (RingNode a m) where
 	           	return (a ++ c, d)
 	fail s = RingNode (fail s)
 
--- implementat of MonadTrans for RingNode
+-- implementatio of MonadTrans for RingNode
 instance MonadTrans (RingNode a) where
 	lift = RingNode . liftM (\x -> ([], x))
+
 
 -- forward some token to the next process in the ring
 forward :: Monad m => a -> RingNode a m ()
