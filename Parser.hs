@@ -76,7 +76,7 @@ canonicaliseURI u = u {uriPath = if null $ uriPath u then "/" else uriPath u, ur
 -- makes uri absolute if not so; in case it is relative it will be related to h
 makeAbsoluteURI :: URI -> String -> Maybe URI
 --makeAbsoluteURI h = liftM (\u -> if Network.URI.uriIsRelative u then u `relativeTo` h else u) . parseURIReference
-makeAbsoluteURI h = liftM (\u -> fromMaybe u $ u `relativeTo` h) . parseURIReference
+makeAbsoluteURI h = liftM (\u -> u `relativeTo` h) . parseURIReference
 
 -- get text of tags
 getInnerText :: StringLike str => [Tag str] -> str
