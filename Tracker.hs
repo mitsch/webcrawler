@@ -1,10 +1,10 @@
 module Tracker (
-	TrackState,
-	TrackStateT,
-	memoriseInvalidTypeSuffix,
-	memoriseHistory,
-	memoriseRobots,
-	track
+--	TrackState,
+--	TrackStateT,
+--	memoriseInvalidTypeSuffix,
+--	memoriseHistory,
+--	memoriseRobots
+--	track
 ) where
 
 import Data.Set hiding (foldl, map)
@@ -99,24 +99,24 @@ getTrackedRobots :: Monad m => TrackStateT m a -> TrackStateT m [(String, Robots
 getTrackedRobots t = TrackStateT (runTrackStateT t >>= return . return . robots)
 
 -- tracks web page
-track :: String -> (URI -> IO String) -> TrackStateT IO URI -> TrackStateT IO (Maybe URI)
-track a g t = do
-	u <- t
-	s <- getTrackedBadSuffixes t
-	h <- getTrackedHistory t
-	r <- getTrackedRobots t
-	if member u h || (fromMaybe False $ fmap (flip member s) $ getSuffix u)
-	then return Nothing
-	else do
-		r' <- case lookup (uriRegName $ fromJust $ uriAuthority u) r of
-		      	Just r' -> return r'
-		      	Nothing -> do
-		        	r' <- lift $ fmap (makeRobots a) $ g u {uriPath = "/robots.txt", uriQuery = "", uriFragment = ""}
-		        	TrackStateT $ return $ memoriseRobots a r'
-		        	return r'
-		if isRobotsConform r' u
-		then do
-			TrackStateT $ return $ memoriseHistory u
-			liftM Just $ return u
-		else return Nothing
+-- track :: String -> (URI -> IO String) -> TrackStateT IO URI -> TrackStateT IO (Maybe URI)
+--track a g t = do
+--	u <- t
+--	s <- getTrackedBadSuffixes t
+--	h <- getTrackedHistory t
+--	r <- getTrackedRobots t
+--	if member u h || (fromMaybe False $ fmap (flip member s) $ getSuffix u)
+--	then return Nothing
+--	else do
+--		r' <- case lookup (uriRegName $ fromJust $ uriAuthority u) r of
+--		      	Just r' -> return r'
+--		      	Nothing -> do
+--		        	r' <- lift $ fmap (makeRobots a) $ g u {uriPath = "/robots.txt", uriQuery = "", uriFragment = ""}
+--		        	TrackStateT $ return $ memoriseRobots a r'
+--		        	return r'
+--		if isRobotsConform r' u
+--		then do
+--			TrackStateT $ return $ memoriseHistory u
+--			liftM Just $ return u
+--		else return Nothing
 
