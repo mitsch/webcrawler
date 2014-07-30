@@ -1,6 +1,6 @@
 module Ring (
-	RingChan,
-	OutputChan,
+	RingCarrier,
+	OutputCarrier,
 	RingNode,
 	forward,
 	forwardList,
@@ -17,45 +17,40 @@ module Ring (
 ) where
 
 import Prelude hiding (log)
-import Control.Concurrent.Chan
 import System.IO()
 import Control.Monad
 import Control.Monad.Trans.Class
+import ChanClass
 
 -- signal carrier for ring system
-data RingCarrier a = RingValue a | RingLastValue | RingClosing
+data RingCarrier a = RingValue ! a | RingLastValue | RingClosing
 
--- ring channel
-type RingChan a = Chan (RingCarrier a)
-
-writeRingChan :: RingChan a -> a -> IO ()
+-- interface for writing and reading ring channel
+writeRingChan :: ChanClass c => c (RingCarrier a) -> a -> IO ()
 writeRingChan c x = writeChan c $ RingValue x
 
-writeListRingChan :: RingChan a -> [a] -> IO ()
+writeListRingChan :: ChanClass c =>  c (RingCarrier a) -> [a] -> IO ()
 writeListRingChan c x = writeList2Chan c $ map RingValue x
 
-signalLastRingChan :: RingChan a -> IO ()
+signalLastRingChan :: ChanClass c => c (RingCarrier a) -> IO ()
 signalLastRingChan c = writeChan c RingLastValue
 
-signalClosingRingChan :: RingChan a -> IO ()
+signalClosingRingChan :: ChanClass c => c (RingCarrier a) -> IO ()
 signalClosingRingChan c = writeChan c RingClosing
 
 -- signal carrier for output system
 data OutputCarrier a = OutputValue a | OutputClosedSource
 
--- output channel
-type OutputChan a = Chan (OutputCarrier a)
-
 -- writes value into output channel
-writeOutputChan :: OutputChan a -> a -> IO ()
+writeOutputChan :: ChanClass c => c (OutputCarrier a) -> a -> IO ()
 writeOutputChan c x = writeChan c $ OutputValue x
 
 -- writes values into output channel
-writeListOutputChan :: OutputChan a -> [a] -> IO ()
+writeListOutputChan :: ChanClass c => c (OutputCarrier a) -> [a] -> IO ()
 writeListOutputChan c xs = writeList2Chan c $ map OutputValue xs
 
 -- closes source of output
-closeOutputChan :: OutputChan a -> IO ()
+closeOutputChan :: ChanClass c => c (OutputCarrier a) -> IO ()
 closeOutputChan c = writeChan c OutputClosedSource
 
 -- state of ring node process
@@ -86,10 +81,10 @@ forwardList x = RingNode $ return (x, ())
 -- strict looping over some state a with option to the end the loop
 loop_ :: Monad m => a -> (a -> m (a, Bool)) -> m a
 loop_ i f = g i
-	where g x = f x >>= (\(v, b) -> if b then v `seq` g v else return v)
+	where g x = f x >>= (\(v, b) -> v `seq` (if b then g v else return v))
 
 -- carries out a ring node with some state for the handler routine f
-runRingS :: RingChan a -> RingChan b -> e -> (e -> a -> RingNode b IO e) -> IO e
+runRingS :: (ChanClass c1, ChanClass c2) => c1 (RingCarrier a) -> c2 (RingCarrier b) -> e -> (e -> a -> RingNode b IO e) -> IO e
 runRingS x y i f = fmap snd $ loop_ (False, i) $ \(gotLastEntry, state) -> do
 	nextCarrier <- readChan x
 	case nextCarrier of
@@ -104,11 +99,11 @@ runRingS x y i f = fmap snd $ loop_ (False, i) $ \(gotLastEntry, state) -> do
 		RingClosing -> signalClosingRingChan y >> return ((True, state), False)
 
 -- carries out a ring node with stateless hanlder routine f
-runRing :: RingChan a -> RingChan b -> (a -> RingNode b IO ()) -> IO ()
+runRing :: (ChanClass c1, ChanClass c2) => c1 (RingCarrier a) -> c2 (RingCarrier b) -> (a -> RingNode b IO ()) -> IO ()
 runRing x y f = void $ runRingS x y () (\_ a -> f a)
 
 -- carries out output sink node
-runOutput :: OutputChan a -> Int -> (a -> IO ()) -> IO ()
+runOutput :: ChanClass c => c (OutputCarrier a) -> Int -> (a -> IO ()) -> IO ()
 runOutput c m f = g m
 	where g n = do
 		if n == 0 then return ()
