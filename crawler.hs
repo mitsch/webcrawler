@@ -21,7 +21,8 @@ import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class
 import Control.Concurrent
 import Control.Exception hiding (handle)
-import Control.Concurrent.Chan()
+import qualified Control.Concurrent.Chan as C
+import qualified Control.Concurrent.BoundedChan as B
 import Control.Concurrent.MVar()
 import Data.Maybe
 import Data.Set (Set, insert, member, fromList)
@@ -34,7 +35,7 @@ import qualified Data.Text.IO as TIO
 import Parser
 import Robots
 import Ring
-
+import ChanClass
 
 
 -- splits on every element whose prediction p returns True
@@ -71,18 +72,18 @@ mapM'_ f = g
 	where g (x:xs) = f x >>= (\y -> y `seq` (g xs))
 	      g [] = return ()
 
-data MyOutput = StdOut T.Text | StdErr T.Text | StdOutFlush
+data MyOutput = StdOut !T.Text | StdErr !T.Text | StdOutFlush
 
 -- puts to standard output
-put :: OutputChan MyOutput -> T.Text -> IO ()
+put :: ChanClass c => c (OutputCarrier MyOutput) -> T.Text -> IO ()
 put c m = writeOutputChan c $ StdOut m
 
 -- puts list to standard output
-putList :: OutputChan MyOutput -> [T.Text] -> IO ()
+putList :: ChanClass c => c (OutputCarrier MyOutput) -> [T.Text] -> IO ()
 putList c ms = writeListOutputChan c $ map StdOut ms
 
 -- logs to standard error
-log :: OutputChan MyOutput -> T.Text -> IO ()
+log :: ChanClass c => c (OutputCarrier MyOutput) -> T.Text -> IO ()
 log c m = do
 	time <- getClockTime >>= toCalendarTime
 	let ctTZTime = ctTZ time
@@ -92,7 +93,7 @@ log c m = do
 	writeOutputChan c $ StdErr $ (T.pack $ timeT ++ "\t") `T.append` m
 
 -- logs list to standard error
-logList :: OutputChan MyOutput -> [T.Text] -> IO ()
+logList :: ChanClass c => c (OutputCarrier MyOutput) -> [T.Text] -> IO ()
 logList c ms = do
 	time <- getClockTime >>= toCalendarTime
 	let ctTZTime = ctTZ time
@@ -102,24 +103,24 @@ logList c ms = do
 	writeListOutputChan c $ map (\m -> StdErr $ (T.pack $ timeT ++ "\t") `T.append` m) ms
 
 -- flushes standard output as soon as this signal has its turn
-flushOutput :: OutputChan MyOutput -> IO ()
+flushOutput :: ChanClass c => c (OutputCarrier MyOutput) -> IO ()
 flushOutput c = writeOutputChan c StdOutFlush
 
 -- logs http error
-logHTTPError :: OutputChan MyOutput -> URI -> Int -> T.Text -> IO ()
+logHTTPError :: ChanClass c => c (OutputCarrier MyOutput) -> URI -> Int -> T.Text -> IO ()
 logHTTPError chan url code message = log chan $ (T.pack $ "http error on " ++ show url ++ " with code " ++ show code ++ ": ") `T.append` message
 
 -- logs network error
-logNetworkError :: OutputChan MyOutput -> URI -> T.Text -> IO ()
+logNetworkError :: ChanClass c => c (OutputCarrier MyOutput) -> URI -> T.Text -> IO ()
 logNetworkError chan url message = log chan $ (T.pack $ "network error on " ++ show url ++ " with ") `T.append` message
 
 -- puts redirection out
-putRedirection :: OutputChan MyOutput -> URI -> URI -> Int -> T.Text -> IO ()
+putRedirection :: ChanClass c => c (OutputCarrier MyOutput) -> URI -> URI -> Int -> T.Text -> IO ()
 putRedirection chan u l code suffix 
 	= put chan $ (T.pack $ intercalate "\t" ["redirection", show u, show l, show code]) `T.append` (T.singleton '\t') `T.append` suffix
 
 -- puts visit out
-putVisit :: OutputChan MyOutput -> URI -> T.Text -> T.Text -> IO ()
+putVisit :: ChanClass c => c (OutputCarrier MyOutput) -> URI -> T.Text -> T.Text -> IO ()
 putVisit chan u fileName suffix = put chan $ T.intercalate (T.singleton '\t') [T.pack "visit", T.pack $ show u, fileName, suffix]
 
 -- download settings for web page download
@@ -131,7 +132,7 @@ data DownloadSettings = DownloadSettings {
 	downloadGoodSuffixes :: [T.Text]}
 
 -- downloader routine
-downloader :: DownloadSettings -> RingChan URI -> RingChan (URI, Response L.ByteString) -> RingChan Track -> OutputChan MyOutput -> IO ()
+downloader :: (ChanClass c1, ChanClass c2, ChanClass c3, ChanClass c4) => DownloadSettings -> c1 (RingCarrier URI) -> c2 (RingCarrier (URI, Response L.ByteString)) -> c3 (RingCarrier Track) -> c4 (OutputCarrier MyOutput) -> IO ()
 downloader settings urlChannel responseChannel trackChannel outputChannel = do
 	clockTime <- getClockTime
 	setStdGen $ mkStdGen $ ctMin $ toUTCTime clockTime
@@ -192,7 +193,7 @@ data ParserSettings = ParserSettings {
 	parserFileCaching :: Maybe (String, String)}
 
 -- parser routine
-parser :: ParserSettings -> RingChan (URI, Response L.ByteString) -> RingChan Track -> OutputChan MyOutput -> IO ()
+parser :: (ChanClass c1, ChanClass c2, ChanClass c3) => ParserSettings -> c1 (RingCarrier (URI, Response L.ByteString)) -> c2 (RingCarrier Track) -> c3 (OutputCarrier MyOutput) -> IO ()
 parser settings responseChannel trackChannel outputChannel = runRing responseChannel trackChannel $ \(u, r) -> do
 	let convertURI s = parseURIReference s >>= \l -> return $ l`relativeTo` u
 	let headers = responseHeaders r
@@ -206,8 +207,8 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 	     	Nothing -> lift $ logHTTPError outputChannel u code $ T.pack "despite redirection no location given";
 	     	Just l -> do
 	     		when (doLooping l) (forward $ NewSeed l);
-				lift $ putRedirection outputChannel u l code (maybe T.empty T.pack $ getSuffix l);
-				lift $ putVisit outputChannel u T.empty (maybe T.empty T.pack $ getSuffix l);
+	     		lift $ putRedirection outputChannel u l code (maybe T.empty T.pack $ getSuffix l);
+	     		lift $ putVisit outputChannel u T.empty (maybe T.empty T.pack $ getSuffix l);
 	     		lift $ log outputChannel $ T.pack $ "parsed redirection " ++ show u
 	else if code == 200
 	then do
@@ -231,7 +232,7 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 data Track = NewSeed URI | MarkInvalidType T.Text
 
 -- keeps track of visited web pages, invalid type suffixes and robots texts
-tracker :: [T.Text] -> [T.Text] -> [T.Text] -> String -> RingChan Track -> RingChan URI -> OutputChan MyOutput -> IO ()
+tracker :: (ChanClass c1, ChanClass c2, ChanClass c3) => [T.Text] -> [T.Text] -> [T.Text] -> String -> c1 (RingCarrier Track) -> c2 (RingCarrier URI) -> c3 (OutputCarrier MyOutput) -> IO ()
 tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputChannel
 	= void $ runRingS trackChannel urlChannel (badSuffixes, history, []) $ \ (badSuffixes_, history_, robots_) t -> do
 	  	case t of
@@ -284,8 +285,9 @@ tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputCha
 
 
 data Flag = Help | LoopRestriction (URI -> URI -> Bool) | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int |
-            BadSuffixes FilePath | Histories FilePath | BadSuffix String | History String | SyncOutput |
-						Pattern ParserOutput | FileCaching String | ReadFromStdInput | GoodSuffixes FilePath | GoodSuffix String
+            BadSuffixes FilePath | Histories FilePath | BadSuffix String | History String | 
+						Pattern ParserOutput | FileCaching String | ReadFromStdInput | GoodSuffixes FilePath | GoodSuffix String |
+						ResponseChannelBound Int
 
 options :: [OptDescr Flag]
 options = [
@@ -304,7 +306,6 @@ options = [
 	Option "b" ["bad-suffix"] (ReqArg (\s -> BadSuffix s) "SUFFIX") "SUFFIX indicates no html resource",
 	Option "g" ["good-suffix"] (ReqArg (\s -> GoodSuffix s) "SUFFIX") "SUFFIX indicates html resource",
 	Option "h" ["history"] (ReqArg (\s -> History s) "URL") "URL is considered to be already visited",
-	Option "" ["sync-output"] (NoArg SyncOutput) "synchronises output and log messages",
 	Option "" ["print-precontext"] (OptArg (\x -> Pattern $ PreContext (fmap read x) (switchMaybe "div" x)) "NUMBER")
 		"prints NUMBERs words of text context before the reference; if called without a number it is limited to div tag areas",
 	Option "" ["print-postcontext"] (OptArg (\x -> Pattern $ PostContext (fmap read x) (switchMaybe "div" x)) "NUMBER")
@@ -316,13 +317,14 @@ options = [
 	Option "" ["print-name"] (NoArg $ Pattern ReferenceName) "prints name of the reference tag",
 	Option "" ["print-ref-suffix"] (NoArg $ Pattern ReferenceSuffix) "prints suffix of reference",
 	Option "" ["cache-file"] (ReqArg FileCaching "FILE") "caches crawled resources to some files according to the template FILE",
-	Option "" ["read-input"] (NoArg ReadFromStdInput) "reads urls to crawl also from standard input"]
+	Option "" ["read-input"] (NoArg ReadFromStdInput) "reads urls to crawl also from standard input",
+	Option "" ["response-channel-bound"] (ReqArg (ResponseChannelBound . read) "MAX") "limit response channel to MAX; default is 5"]
 
 
 main :: IO ()
 main = do
 	(originSeeds, loopRestrictions, userAgent, timeOut, sleepTime, badSuffixes, goodSuffixes, history,
-		patterns, fileCaching, readStdInput) <- getArgs >>= (\args ->
+		patterns, fileCaching, readStdInput, responseChannelBound) <- getArgs >>= (\args ->
 		case getOpt Permute options args of
 			(o,n,[]) -> do
 				-- help flag anywhere ?
@@ -369,13 +371,16 @@ main = do
 				                  	(return . splitFilePattern)
 				-- take also references from the standard input
 				let readFromInput = any (\f -> case f of {ReadFromStdInput->True;_->False}) o
+				-- takes bound for response channel; default is 5
+				let responseChannelBound = fromMaybe 5 $ listToMaybe $
+					mapMaybe (\f -> case f of {(ResponseChannelBound v) -> Just v; _ -> Nothing}) o
 				return (validSeeds, loopRestrictions, userAgent, timeOut, sleepTime, badSuffixes, goodSuffixes,
-				    	history, patterns, fileCaching, readFromInput)
+				    	history, patterns, fileCaching, readFromInput, responseChannelBound)
 			(_,_,errs) -> ioError (userError (concat errs ++ usageInfo "usage: crawler [OPTION ...] urls..." options)))
-	seedChannel <- newChan
-	responseChannel <- newChan
-	outputChannel <- newChan
-	trackChannel <- newChan
+	seedChannel <- C.newChan
+	responseChannel <- B.newBoundedChan responseChannelBound
+	outputChannel <- C.newChan
+	trackChannel <- C.newChan
 	-- download thread
 	void $ forkIO $ do
 		log outputChannel $ T.pack "download thread started"
