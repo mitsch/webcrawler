@@ -1,5 +1,5 @@
 FH Aachen	http://opus.bibliothek.fh-aachen.de/opus/
-RWTH Aachen http://www.bth.rwth-aachen.de/opus3
+RWTH Aachen	http://134.130.184.8/opus3/
 FH Aalen	http://opus-htw-aalen.bsz-bw.de/
 Universität Augsburg	http://opus.bibliothek.uni-augsburg.de/
 Universität Bamberg	http://www.opus-bayern.de/uni-bamberg/
@@ -13,7 +13,7 @@ Robert Koch Institut Berlin	http://edoc.rki.de/
 ZIB Berlin	http://vs24.kobv.de/opus4-zib/home
 Berlin-Brandenburgische Akademie der Wissenschaften	http://edoc.bbaw.de/
 Universität der Künste Berlin	http://opus.kobv.de/udk/
-MDC Berlin	 http://edoc.mdc-berlin.de/
+MDC Berlin	http://edoc.mdc-berlin.de/
 HZB Berlin	http://www.helmholtz-berlin.de/angebote/bibliothek/literatur/veroeffentlichungsverzeichnis_de.html
 Universität Bielefeld (eCollection)	http://biecoll.ub.uni-bielefeld.de/
 Universität Bielefeld	http://pub.uni-bielefeld.de/
@@ -27,7 +27,7 @@ HBK Braunschweig	http://opus.hbk-bs.de/
 Universität Bremen	http://elib.suub.uni-bremen.de/
 AWI Bremerhaven	http://epic.awi.de/
 TU Chemnitz	http://monarch.qucosa.de/
-Universität Clausthal http://www.bibliothek.tu-clausthal.de/de/hochschulbibliographie/online-schriftenreihen/
+Universität Clausthal	http://www.bibliothek.tu-clausthal.de/de/hochschulbibliographie/online-schriftenreihen/
 TU Cottbus	http://opus.kobv.de/btu/
 GSI Darmstadt	http://elib.tu-darmstadt.de/ulb//epda/epda.htm
 FH Darmstadt	http://www.publikationswelt.h-da.de/
@@ -45,7 +45,7 @@ Universität Flensburg	http://www.zhb-flensburg.de/dissert.html
 Universität Frankfurt Main (Biologie)	http://www.vifabio.de/vifabioDOC/
 Universität Frankfurt Main	http://publikationen.stub.uni-frankfurt.de/
 FH Frankfurt Main	http://fhffm.bsz-bw.de/home
-DNB Frankfurt Main https://portal.d-nb.de/
+DNB Frankfurt Main	https://portal.d-nb.de/
 DIPFS Frankfurt Main	http://www.pedocs.de/
 Universität Frankfurt Oder	http://opus.kobv.de/euv/
 TU Freiberg	http://tubaf.qucosa.de/
@@ -60,7 +60,7 @@ TU Göttingen	http://geoleoedocs.sub.uni-goettingen.de:8080/dspace
 Universität Göttingen	http://goedoc.uni-goettingen.de/goescholar/
 Niedersächsische Staats- und Universitätsbibliothek Göttingen	http://gdz.sub.uni-goettingen.de/
 Akademie der Wissenschaften	http://rep.adw-goe.de/
-Universität Göttingen 2 http://webdoc.sub.gwdg.de/
+Universität Göttingen 2	http://webdoc.sub.gwdg.de/
 Universität Halle-Wittenberg	http://sundoc.bibliothek.uni-halle.de/
 Universität Magedburg	http://edoc.bibliothek.uni-halle.de/
 HBK Hamburg	http://ask23.hfbk-hamburg.de/
@@ -87,7 +87,7 @@ Universität Karlsruhe Süd	http://www.ubka.uni-karlsruhe.de/eva/index.html
 FH Karlsruhe	http://opus.bsz-bw.de/phka/
 Universität Karlsruhe Nord	http://www.karola-online.de/
 Universität Kassel	https://kobra.bibliothek.uni-kassel.de/
-Universität Kiel		http://macau.uni-kiel.de/
+Universität Kiel	http://macau.uni-kiel.de/
 Leibniz Institut für Meereswissenschaften Kiel	http://eprints.ifm-geomar.de/
 ZBW Kiel Hamburg	http://www.econstor.eu/
 Universität Koblenz Landau	http://kola.opus.hbz-nrw.de/
@@ -141,7 +141,7 @@ FH Reutlingen	http://www.opus-bayern.de/bib-info/
 Universität Rostock	http://rosdok.uni-rostock.de/
 Universität Saarbrücken	http://scidok.sulb.uni-saarland.de/
 Universität Saarbrücken (Psychologie)	http://psydok.sulb.uni-saarland.de/
-SLUB Dresden		http://www.qucosa.de/
+SLUB Dresden	http://www.qucosa.de/
 PH Schwäbisch Gmünd	http://opus.bsz-bw.de/phsg/
 Universität Siegen	http://dokumentix.ub.uni-siegen.de/opus/
 FH Stuttgart	http://opus.bsz-bw.de/hdms/
