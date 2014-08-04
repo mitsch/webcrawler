@@ -76,7 +76,7 @@ canonicaliseURI u = u {uriPath = if null $ uriPath u then "/" else uriPath u, ur
 -- makes uri absolute if not so; in case it is relative it will be related to h
 makeAbsoluteURI :: URI -> String -> Maybe URI
 --makeAbsoluteURI h = liftM (\u -> if Network.URI.uriIsRelative u then u `relativeTo` h else u) . parseURIReference
-makeAbsoluteURI h = liftM (\u -> u `relativeTo` h) . parseURIReference
+makeAbsoluteURI h = liftM (\u -> if uriScheme u /= "" then u else  u `relativeTo` h) . parseURIReference
 
 -- get text of tags
 getInnerText :: StringLike str => [Tag str] -> str
@@ -112,8 +112,6 @@ printOutput ps pre post mainTag mainArea = map g ps
 	                           in takeWhile (\t -> (not $ isTagOpenName n' t) || (not $ isTagCloseName n' t)) ts
 	      cutPostWordLim s n = unwordsSL $ take n $ wordsSL s
 
-
-
 parse :: (Show str, Eq str, StringLike str) => [ParserOutput] -> URI -> str -> [(URI, [str])]
 parse outputs host document = let
 	getSplits p t = map (\(pre, post) -> let (a, b) = t post in (pre, b, head post, a)) . split p;
@@ -121,5 +119,6 @@ parse outputs host document = let
 	getHRef = toString . fromAttrib (fromString "href");
 	anchors = getSplits (isTagOpenName (fromChar 'a')) (span (isTagCloseName (fromChar 'a'))) tags;
 	links = getSplits (isTagOpenName (fromString "link")) (\t -> ([head t], tail t)) tags
-	in mapMaybe (\(a,b,c,d) -> (makeAbsoluteURI host $ getHRef c) >>= \u -> return (canonicaliseURI u, printOutput outputs a b c d)) $
+	in mapMaybe (\(a,b,c,d) -> (makeAbsoluteURI host $ getHRef c) >>=
+	             \u -> return (canonicaliseURI u, printOutput outputs a b c d)) $
 	   anchors ++ links
