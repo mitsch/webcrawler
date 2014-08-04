@@ -137,15 +137,16 @@ downloader settings urlChannel responseChannel trackChannel outputChannel = do
 	clockTime <- getClockTime
 	setStdGen $ mkStdGen $ ctMin $ toUTCTime clockTime
 	manager <- newManager $ tlsManagerSettings {managerResponseTimeout = downloadMaximumTimeOut settings}
+	-- handles sleeping
+	let sleep = case downloadMaximumSleepTime settings of {Nothing -> return (); Just t' -> lift $ randomRIO (0, t') >>= threadDelay}
+	-- the good suffixes should never appear in the bad suffix collection
 	let goodSuffixes = downloadGoodSuffixes settings
 	-- start the ring
 	void $ runRingS urlChannel responseChannel (downloadBadSuffixes settings) $ \ badSuffixes u -> do
 		let suffix = getSuffix u >>= return . T.pack
 		if fromMaybe True $ fmap (\s -> s `elem` goodSuffixes || s `notElem` badSuffixes) suffix
 		then do
-			case downloadMaximumSleepTime settings of
-				Nothing -> return ()
-				Just t' -> lift $ randomRIO (0, t') >>= threadDelay
+			sleep
 			initReq <- lift $ parseUrl $ show u
 			let req = initReq { method = methodGet,
 			                    requestHeaders = [(hUserAgent, S.pack $ downloadUserAgent settings)],
@@ -156,31 +157,32 @@ downloader settings urlChannel responseChannel trackChannel outputChannel = do
 				resp <- http req manager
 				let headers = responseHeaders resp
 				let contentType = lookup hContentType headers >>= return . S.unpack
-	  			if maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
-	  			then do
-	  				liftIO $ log outputChannel $ T.pack $ "continue downloading " ++ (show u)
-	  				sinkedResponse <- lbsResponse resp
-	  				liftIO $ log outputChannel $ T.pack $ "downloaded " ++ (show u)
+				if maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
+				then do
+					liftIO $ log outputChannel $ T.pack $ "continue downloading " ++ (show u)
+					sinkedResponse <- lbsResponse resp
+					liftIO $ log outputChannel $ T.pack $ "downloaded " ++ (show u)
 					return (badSuffixes, Just (u, sinkedResponse))
-	  			else do
-	  				liftIO $ put outputChannel $ T.pack $ intercalate "\t" $ ["invalid type", show u, "", fromMaybe "" $ getSuffix u,
-	  				                                                        fromMaybe "" contentType]
-	  				liftIO $ log outputChannel $ T.pack $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++ "\"" ++
-	  				                                    " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
-	  				case mfilter (not . flip elem goodSuffixes) suffix of
-	  					Nothing -> return (badSuffixes, Nothing)
-	  					Just s -> do
-	  						liftIO $ writeRingChan trackChannel $ MarkInvalidType s
-	  						return (s : badSuffixes, Nothing)
-	  		case result of
-	  			Left err -> do
-	  				lift $ logNetworkError outputChannel u $ T.pack $ show (err :: SomeException)
-	  				return badSuffixes
+				else do
+					liftIO $ put outputChannel $ T.pack $ intercalate "\t" $ ["invalid type", show u, "", fromMaybe "" $ getSuffix u,
+						                                                        fromMaybe "" contentType]
+					liftIO $ log outputChannel $ T.pack $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++
+						                "\"" ++ " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
+					case mfilter (not . flip elem goodSuffixes) suffix of
+						Nothing -> return (badSuffixes, Nothing)
+						Just s -> do
+							liftIO $ writeRingChan trackChannel $ MarkInvalidType s
+							return (s : badSuffixes, Nothing)
+			case result of
+				Left err -> do
+					lift $ logNetworkError outputChannel u $ T.pack $ show (err :: SomeException)
+					return badSuffixes
 				Right (badSuffixes_, maybeForward) -> do
 					maybe (return ()) (forward) maybeForward
 					return badSuffixes_
 		else do
-			lift $ log outputChannel $ (T.pack $ "url \"" ++ show u ++ "\" contains suffix \"") `T.append` (fromMaybe T.empty suffix) `T.append`
+			lift $ log outputChannel $ (T.pack $ "url \"" ++ show u ++ "\" contains suffix \"") `T.append`
+			                           (fromMaybe T.empty suffix) `T.append`
 			                           (T.pack "\" indicating invalid type document")
 			return badSuffixes
 	closeManager manager
@@ -229,7 +231,7 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 
 
 -- track objects
-data Track = NewSeed URI | MarkInvalidType T.Text
+data Track = NewSeed !URI | MarkInvalidType !T.Text
 
 -- keeps track of visited web pages, invalid type suffixes and robots texts
 tracker :: (ChanClass c1, ChanClass c2, ChanClass c3) => [T.Text] -> [T.Text] -> [T.Text] -> String -> c1 (RingCarrier Track) -> c2 (RingCarrier URI) -> c3 (OutputCarrier MyOutput) -> IO ()
