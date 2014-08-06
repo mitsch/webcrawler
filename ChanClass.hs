@@ -18,3 +18,4 @@ instance ChanClass (B.BoundedChan) where
 	writeChan = B.writeChan
 	writeList2Chan = B.writeList2Chan
 	readChan = B.readChan
+
