@@ -17,13 +17,11 @@ import System.Time
 import System.Random
 import Control.Monad
 import Control.Monad.Trans.Class
-import Control.Monad.Trans.Resource (runResourceT)
-import Control.Monad.IO.Class
 import Control.Concurrent
 import Control.Exception hiding (handle)
 import qualified Control.Concurrent.Chan as C
 import qualified Control.Concurrent.BoundedChan as B
-import Control.Concurrent.MVar()
+import Control.DeepSeq
 import Data.Maybe
 import Data.Set (Set, insert, member, fromList)
 import Data.List
@@ -37,6 +35,13 @@ import Robots
 import Ring
 import ChanClass
 
+
+instance NFData (URIAuth) where
+	rnf a = (rnf $ uriUserInfo a) `seq` (rnf $ uriRegName a) `seq` (rnf $ uriPort a) `seq` ()
+
+instance NFData (URI) where
+	rnf u = (rnf $ uriScheme u) `seq` (rnf $ uriAuthority u) `seq` (rnf $ uriPath u) `seq`
+	        (rnf $ uriQuery u) `seq` (rnf $ uriFragment u) `seq` ()
 
 -- splits on every element whose prediction p returns True
 splitOn :: (a -> Bool) -> [a] -> [[a]]
@@ -72,15 +77,16 @@ mapM'_ f = g
 	where g (x:xs) = f x >>= (\y -> y `seq` (g xs))
 	      g [] = return ()
 
+
 data MyOutput = StdOut !T.Text | StdErr !T.Text | StdOutFlush
 
 -- puts to standard output
 put :: ChanClass c => c (OutputCarrier MyOutput) -> T.Text -> IO ()
-put c m = writeOutputChan c $ StdOut m
+put c m = (writeOutputChan c . StdOut ) $!! m
 
 -- puts list to standard output
 putList :: ChanClass c => c (OutputCarrier MyOutput) -> [T.Text] -> IO ()
-putList c ms = writeListOutputChan c $ map StdOut ms
+putList c ms = (writeListOutputChan c . map StdOut) $!! ms
 
 -- logs to standard error
 log :: ChanClass c => c (OutputCarrier MyOutput) -> T.Text -> IO ()
@@ -90,7 +96,7 @@ log c m = do
 	let timeT = (show $ ctYear time) ++ "-" ++ (show $ ctMonth time) ++ "-" ++ (show $ ctDay time) ++ "T" ++
 	            (show $ ctHour time) ++ ":" ++ (show $ ctMin time) ++ ":" ++ (show $ ctSec time) ++ "+" ++
 	            (show $ ctTZTime `div` 3600) ++ ":" ++ (show $ ((ctTZTime `div` 60) `mod` 60))
-	writeOutputChan c $ StdErr $ (T.pack $ timeT ++ "\t") `T.append` m
+	(writeOutputChan c . StdErr) $!! (T.pack $ timeT ++ "\t") `T.append` m
 
 -- logs list to standard error
 logList :: ChanClass c => c (OutputCarrier MyOutput) -> [T.Text] -> IO ()
@@ -100,7 +106,7 @@ logList c ms = do
 	let timeT = (show $ ctYear time) ++ "-" ++ (show $ ctMonth time) ++ "-" ++ (show $ ctDay time) ++ "T" ++
 	            (show $ ctHour time) ++ ":" ++ (show $ ctMin time) ++ ":" ++ (show $ ctSec time) ++ "+" ++
 							(show $ ctTZTime `div` 3600) ++ ":" ++ (show $ ((ctTZTime `div` 60) `mod` 60))
-	writeListOutputChan c $ map (\m -> StdErr $ (T.pack $ timeT ++ "\t") `T.append` m) ms
+	(writeListOutputChan c . map (\m -> StdErr $ (T.pack $ timeT ++ "\t") `T.append` m)) $!! ms
 
 -- flushes standard output as soon as this signal has its turn
 flushOutput :: ChanClass c => c (OutputCarrier MyOutput) -> IO ()
@@ -137,55 +143,51 @@ downloader settings urlChannel responseChannel trackChannel outputChannel = do
 	clockTime <- getClockTime
 	setStdGen $ mkStdGen $ ctMin $ toUTCTime clockTime
 	manager <- newManager $ tlsManagerSettings {managerResponseTimeout = downloadMaximumTimeOut settings}
+	-- handles sleeping
+	let sleep = case downloadMaximumSleepTime settings of {Nothing -> return (); Just t' -> lift $ randomRIO (0, t') >>= threadDelay}
+	-- the good suffixes should never appear in the bad suffix collection
 	let goodSuffixes = downloadGoodSuffixes settings
 	-- start the ring
 	void $ runRingS urlChannel responseChannel (downloadBadSuffixes settings) $ \ badSuffixes u -> do
 		let suffix = getSuffix u >>= return . T.pack
 		if fromMaybe True $ fmap (\s -> s `elem` goodSuffixes || s `notElem` badSuffixes) suffix
 		then do
-			case downloadMaximumSleepTime settings of
-				Nothing -> return ()
-				Just t' -> lift $ randomRIO (0, t') >>= threadDelay
+			sleep
 			initReq <- lift $ parseUrl $ show u
 			let req = initReq { method = methodGet,
 			                    requestHeaders = [(hUserAgent, S.pack $ downloadUserAgent settings)],
 			                    redirectCount = 0,
 			                    checkStatus = \_ _ _ -> Nothing }
 			lift $ log outputChannel $ T.pack $ "downloading " ++ (show u)
-			result <- lift $ try $ runResourceT $ do
-				resp <- http req manager
-				let headers = responseHeaders resp
-				let contentType = lookup hContentType headers >>= return . S.unpack
-	  			if maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
-	  			then do
-	  				liftIO $ log outputChannel $ T.pack $ "continue downloading " ++ (show u)
-	  				sinkedResponse <- lbsResponse resp
-	  				liftIO $ log outputChannel $ T.pack $ "downloaded " ++ (show u)
-					return (badSuffixes, Just (u, sinkedResponse))
-	  			else do
-	  				liftIO $ put outputChannel $ T.pack $ intercalate "\t" $ ["invalid type", show u, "", fromMaybe "" $ getSuffix u,
-	  				                                                        fromMaybe "" contentType]
-	  				liftIO $ log outputChannel $ T.pack $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++ "\"" ++
-	  				                                    " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
-	  				case mfilter (not . flip elem goodSuffixes) suffix of
-	  					Nothing -> return (badSuffixes, Nothing)
-	  					Just s -> do
-	  						liftIO $ writeRingChan trackChannel $ MarkInvalidType s
-	  						return (s : badSuffixes, Nothing)
-	  		case result of
-	  			Left err -> do
-	  				lift $ logNetworkError outputChannel u $ T.pack $ show (err :: SomeException)
-	  				return badSuffixes
-				Right (badSuffixes_, maybeForward) -> do
-					maybe (return ()) (forward) maybeForward
-					return badSuffixes_
+			result <- lift $ try $ httpLbs req manager
+			case result of
+				Left err -> do
+					lift $ logNetworkError outputChannel u $ T.pack $ show (err :: SomeException)
+					return badSuffixes
+				Right resp -> do
+					lift $ log outputChannel $ T.pack $ "downloaded " ++ (show u)
+					let headers = responseHeaders resp
+					let contentType = lookup hContentType headers >>= return . S.unpack
+					if maybe True (\t -> null t || "text/html" `isPrefixOf` t) contentType
+					then do
+						forward (u, resp)
+						return badSuffixes
+					else do
+						lift $ put outputChannel $ T.pack $ intercalate "\t" $ ["invalid type", show u, "", fromMaybe "" $ getSuffix u,
+						                                                         fromMaybe "" contentType]
+						lift $ log outputChannel $ T.pack $ "invalid document on " ++ show u ++ " with type \"" ++ fromMaybe "" contentType ++
+						                                    "\"" ++ " and suffix \"" ++ fromMaybe "" (getSuffix u) ++ "\""
+						case mfilter (not . flip elem goodSuffixes) suffix of 
+							Nothing -> return badSuffixes
+							Just s -> do
+								(lift . writeRingChan trackChannel . MarkInvalidType) $!! s
+								return (s : badSuffixes)
 		else do
-			lift $ log outputChannel $ (T.pack $ "url \"" ++ show u ++ "\" contains suffix \"") `T.append` (fromMaybe T.empty suffix) `T.append`
+			lift $ log outputChannel $ (T.pack $ "url \"" ++ show u ++ "\" contains suffix \"") `T.append`
+			                           (fromMaybe T.empty suffix) `T.append`
 			                           (T.pack "\" indicating invalid type document")
-			return badSuffixes
+			return badSuffixes	
 	closeManager manager
-	
-
 
 data ParserSettings = ParserSettings {
 	parserLoopRestrictions :: [(URI -> URI -> Bool)],
@@ -206,9 +208,10 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 	then case location of
 	     	Nothing -> lift $ logHTTPError outputChannel u code $ T.pack "despite redirection no location given";
 	     	Just l -> do
-	     		when (doLooping l) (forward $ NewSeed l);
-	     		lift $ putRedirection outputChannel u l code (maybe T.empty T.pack $ getSuffix l);
-	     		lift $ putVisit outputChannel u T.empty (maybe T.empty T.pack $ getSuffix l);
+	      	let lSuffix = maybe T.empty T.pack $ getSuffix l;
+	      	when (doLooping l) ((forward . NewSeed) $!! l);
+	     		lift $ putRedirection outputChannel u l code lSuffix;
+	     		lift $ putVisit outputChannel u T.empty lSuffix;
 	     		lift $ log outputChannel $ T.pack $ "parsed redirection " ++ show u
 	else if code == 200
 	then do
@@ -220,7 +223,7 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 				lift $ hClose handle
 				return (Just filePath)
 		let refs = parse (parserOutputs settings) u body
-		forwardList $ map NewSeed $ filter doLooping $ map fst refs
+		(forwardList . map NewSeed) $!! filter doLooping $ map fst refs
 		lift $ putList outputChannel $ map (\(l, t) -> T.pack $ intercalate "\t" $ ["reference", show u, show l] ++ (map L.unpack t)) refs
 		lift $ putVisit outputChannel u (maybe T.empty T.pack fileName) (maybe T.empty  T.pack $ getSuffix u)
 		lift $ log outputChannel $ T.pack $ "parsed html document " ++ show u
@@ -250,8 +253,10 @@ tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputCha
 	  			if uText `elem` history_ then return (badSuffixes_, history_, robots_)
 	  			else if fromMaybe False $ fmap (flip elem badSuffixes_) suffix
 	  			     then do
-	  			     	lift $ log outputChannel $ (T.pack "url \"") `T.append` (T.pack "\" contains suffix \"") `T.append`
-	  			     	                           fromMaybe T.empty suffix `T.append` (T.pack "\" indicating invalid type document")
+	  			     	lift $ log outputChannel $ (T.pack "url \"") `T.append` (T.pack $ show u) `T.append`
+								                           (T.pack "\" contains suffix \"") `T.append`
+	  			     	                           fromMaybe T.empty suffix `T.append`
+																					 (T.pack "\" indicating invalid type document")
 	  			     	return (badSuffixes_, history_, robots_)
 	  			     else case uriAuthority u >>= return . uriRegName of
 	  			          	Nothing -> do
@@ -278,9 +283,10 @@ tracker goodSuffixes badSuffixes history agent trackChannel urlChannel outputCha
 	  			          						let newRobots = makeRobots agent $ L.unpack $ responseBody resp
 	  			          						return (newRobots, (domain, newRobots) : robots_)
 	  			          		if isRobotsConform specRobots u
-	  			          		then forward u >> return (badSuffixes_, uText : history_, newAllRobots)
+	  			          		then (forward $!! u) >> return (badSuffixes_, uText : history_, newAllRobots)
 	  			          		else do
 	  			          			lift $ log outputChannel $ T.pack $ "robots discards " ++ (show u)
+	  			          			lift $ put outputChannel $ T.pack $ "disallow\t" ++ (show u)
 	  			          			return (badSuffixes_, history_, newAllRobots)
 
 

@@ -30,7 +30,7 @@ writeRingChan :: ChanClass c => c (RingCarrier a) -> a -> IO ()
 writeRingChan c x = writeChan c $ RingValue x
 
 writeListRingChan :: ChanClass c =>  c (RingCarrier a) -> [a] -> IO ()
-writeListRingChan c x = writeList2Chan c $ map RingValue x
+writeListRingChan c x = writeList2Chan c $! map RingValue x
 
 signalLastRingChan :: ChanClass c => c (RingCarrier a) -> IO ()
 signalLastRingChan c = writeChan c RingLastValue
@@ -59,10 +59,12 @@ newtype RingNode a m b = RingNode { runRingNode :: m ([a], b)}
 -- implementation of Monad for RingNode
 instance (Monad m) => Monad (RingNode a m) where
 	return x = RingNode $ return ([], x)
-	r >>= g   = RingNode $ do
-	           	(a, b) <- runRingNode r
-	           	(c, d) <- runRingNode $ g b
-	           	return (a ++ c, d)
+	r >>= g = RingNode $ do
+	          	(a, b) <- runRingNode r
+	          	(c, d) <- runRingNode $ g b
+	          	case c of
+	          		[] -> return (a, d)
+	          		e -> return (a ++ e, d)
 	fail s = RingNode (fail s)
 
 -- implementatio of MonadTrans for RingNode

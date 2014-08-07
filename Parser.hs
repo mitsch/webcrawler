@@ -12,6 +12,7 @@ import Data.List
 import Network.URI
 import Text.StringLike()
 import Control.Monad
+import Control.DeepSeq
 
 -- splits on every element whose prediction p returns True
 splitOn :: (a -> Bool) -> [a] -> [[a]]
@@ -61,22 +62,20 @@ removeData s
 	| isPrefixOfSL (fromString "\'data:") s = removeData $ dropSL 1 $ dropWhileSL ('\''==) $ dropSL 6  $ dropSL 6 s
 	| otherwise = maybe empty (\(x, xs) -> x `cons` removeData xs) $ uncons s
 
-split :: (a -> Bool) -> [a] -> [([a], [a])]
-split p ts = unfoldr (uncurry g) ([], ts)
-	where g pre post
-	      	| null post = Nothing
-	        | null b    = Nothing
-	        | otherwise = Just ((pre ++ a, b), (pre ++ a ++ [head a], tail b))
-	        where (a, b) = break p post
-
 -- canonicalise tag
 canonicaliseURI :: URI -> URI
 canonicaliseURI u = u {uriPath = if null $ uriPath u then "/" else uriPath u, uriFragment = ""}
 
+forceURIStrictness :: URI -> URI
+forceURIStrictness u = (uriScheme u) `deepseq` (g $ uriAuthority u) `deepseq` (uriPath u)
+                       `deepseq` (uriFragment u) `deepseq` (uriQuery u) `deepseq` u
+	where g Nothing = ()
+	      g (Just a) = (uriUserInfo a) `deepseq` (uriRegName a) `deepseq` (uriPort a) `deepseq` ()
+
 -- makes uri absolute if not so; in case it is relative it will be related to h
 makeAbsoluteURI :: URI -> String -> Maybe URI
 --makeAbsoluteURI h = liftM (\u -> if Network.URI.uriIsRelative u then u `relativeTo` h else u) . parseURIReference
-makeAbsoluteURI h = liftM (\u -> u `relativeTo` h) . parseURIReference
+makeAbsoluteURI h = liftM (\u -> if uriScheme u /= "" then u else  forceURIStrictness (u `relativeTo` h)) . parseURIReference
 
 -- get text of tags
 getInnerText :: StringLike str => [Tag str] -> str
@@ -92,8 +91,8 @@ data ParserOutput = PreContext (Maybe Int) (Maybe String) |
 										ReferenceSuffix
 
 -- prints output according to the patterns
-printOutput :: (Show str, Eq str, StringLike str) => [ParserOutput] -> [Tag str] -> [Tag str] -> Tag str -> [Tag str] -> [str]
-printOutput ps pre post mainTag mainArea = map g ps
+printOutput :: (Show str, Eq str, StringLike str) => [ParserOutput] -> [Tag str] -> Tag str -> [Tag str] -> [Tag str] -> [str]
+printOutput ps pre mainTag mainArea post = map g ps
 	where g (PreContext wordLim tagLim) = maybeApply cutPreWordLim wordLim $ getInnerText $ maybeApply cutPreTagLim tagLim pre
 	      g (PostContext wordLim tagLim) = maybeApply cutPostWordLim wordLim $ getInnerText $ maybeApply cutPostTagLim tagLim post
 	      g ReferenceText = getInnerText mainArea
@@ -112,14 +111,16 @@ printOutput ps pre post mainTag mainArea = map g ps
 	                           in takeWhile (\t -> (not $ isTagOpenName n' t) || (not $ isTagCloseName n' t)) ts
 	      cutPostWordLim s n = unwordsSL $ take n $ wordsSL s
 
-
-
 parse :: (Show str, Eq str, StringLike str) => [ParserOutput] -> URI -> str -> [(URI, [str])]
 parse outputs host document = let
-	getSplits p t = map (\(pre, post) -> let (a, b) = t post in (pre, b, head post, a)) . split p;
-	tags = canonicalizeTags $ parseTags $ removeData document;
-	getHRef = toString . fromAttrib (fromString "href");
-	anchors = getSplits (isTagOpenName (fromChar 'a')) (span (isTagCloseName (fromChar 'a'))) tags;
-	links = getSplits (isTagOpenName (fromString "link")) (\t -> ([head t], tail t)) tags
-	in mapMaybe (\(a,b,c,d) -> (makeAbsoluteURI host $ getHRef c) >>= \u -> return (canonicaliseURI u, printOutput outputs a b c d)) $
-	   anchors ++ links
+	splitTags _ [] = [];
+	splitTags reversedPreTags (x:xs) = (reverse reversedPreTags, x, xs) : (splitTags (x : reversedPreTags) xs);
+	f (preTags, mainTag, postTags)
+		| (fromChar 'a') `isTagOpenName` mainTag = let (mainTags, postMainTags) = span (isTagCloseName (fromChar 'a')) postTags
+		                                           in Just (preTags, mainTag, mainTags, postMainTags)
+		| (fromString "link") `isTagOpenName` mainTag = Just (preTags, mainTag, [], postTags)
+		| otherwise = Nothing;
+	g (preTags, mainTag, mainTags, postTags) = do
+		u <- makeAbsoluteURI host $ toString $ fromAttrib (fromString "href") mainTag
+		u `seq` (return (canonicaliseURI u, printOutput outputs preTags mainTag mainTags postTags))
+	in mapMaybe g $ mapMaybe f $ splitTags [] $ canonicalizeTags $ parseTags $ removeData document
