@@ -229,7 +229,7 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 
 
 -- track objects
-data Track = NewSeed URI | MarkInvalidType T.Text
+data Track = NewSeed !URI | MarkInvalidType !T.Text
 
 -- keeps track of visited web pages, invalid type suffixes and robots texts
 tracker :: (ChanClass c1, ChanClass c2, ChanClass c3) => [T.Text] -> [T.Text] -> [T.Text] -> String -> c1 (RingCarrier Track) -> c2 (RingCarrier URI) -> c3 (OutputCarrier MyOutput) -> IO ()
