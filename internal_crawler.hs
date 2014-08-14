@@ -299,6 +299,24 @@ tracker externalReferenceQueuing goodSuffixes badSuffixes history agent trackCha
 	  			          			lift $ put outputChannel $!! T.pack $ "disallow\t" ++ (show u)
 	  			          			return (badSuffixes_, history_, newAllRobots)
 
+whenMaybe :: Maybe a -> (a -> IO ()) -> IO ()
+whenMaybe Nothing _ = return ()
+whenMaybe Just a f = f a
+
+download :: Manager -> Maybe Int -> Maybe Int -> String -> [String] -> IO []
+download manager maybeSleep maybeTimeOut userAgent urlTexts = forMStrict urlTexts $ \ urlText -> do
+	case parseAbsoluteURI urlText of
+		Nothing -> log $ "request \"" ++ urlText ++ "\" is not a valid absolute uri!"
+		Just url -> do
+			whenMaybe maybeSleep ()
+	whenMaybe maybeSleep (\t -> randomRIO (0, t) >>= threadDelay)
+	initReq <- parseUrl urlText
+	let req = initReq { method = methodGet,
+	                    requestHeaders = [(hUserAgent, S.pack userAgent)],
+											redirectCount = 0,
+											checkStatus = \_ _ _ -> Nothing }
+	hPutStrLn stderr $!! "downloading " ++ urlText
+	
 
 data Flag = Help | LoopRestriction (URI -> URI -> Bool) | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int |
             BadSuffixes FilePath | Histories FilePath | BadSuffix String | History String | 
@@ -337,6 +355,14 @@ options = [
 	Option "" ["response-channel-bound"] (ReqArg (ResponseChannelBound . read) "MAX") "limit response channel to MAX; default is 5",
 	Option "" ["external-ref-queuing"] (NoArg HandleReferenceQueueOutside) "puts out queueing reference to be handled outside"]
 
+
+main :: IO ()
+main = do
+	(userAgent, timeOut, sleepTime, patterns, fileCaching, workers) <- getArgs >>= ()
+	if workers == 0
+	then
+		 
+	else
 
 main :: IO ()
 main = do
