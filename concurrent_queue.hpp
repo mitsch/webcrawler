@@ -30,6 +30,15 @@ class concurrent_queue
 			_queue.pop();
 			return t;
 		}
+		
+		bool try_pop (T & t)
+		{
+			bool success;
+			std::unique_lock<std::mutex> locker(_mutex);
+			if (_queue.empty()) success = false;
+			else                success = true, t = _queue.front();
+			return success;
+		}
 
 		void push(const T & t)
 		{
