@@ -243,8 +243,8 @@ parser settings responseChannel trackChannel outputChannel = runRing responseCha
 data Track = NewSeed !URI | MarkInvalidType !T.Text
 
 -- keeps track of visited web pages, invalid type suffixes and robots texts
-tracker :: (ChanClass c1, ChanClass c2, ChanClass c3) => Bool -> [T.Text] -> [T.Text] -> [T.Text] -> String -> c1 (RingCarrier Track) -> c2 (RingCarrier URI) -> c3 (OutputCarrier MyOutput) -> IO ()
-tracker externalReferenceQueuing goodSuffixes badSuffixes history agent trackChannel urlChannel outputChannel
+tracker :: (ChanClass c1, ChanClass c2, ChanClass c3) => [Handle] -> Bool -> [T.Text] -> [T.Text] -> [T.Text] -> String -> c1 (RingCarrier Track) -> c2 (RingCarrier URI) -> c3 (OutputCarrier MyOutput) -> IO ()
+tracker externalQueueOutputs disableInternalQueue goodSuffixes badSuffixes history agent trackChannel urlChannel outputChannel
 	= void $ runRingS trackChannel urlChannel (badSuffixes, fromList history, []) $ \ (badSuffixes_, history_, robots_) t -> do
 	  	case t of
 	  		MarkInvalidType suffix -> do
@@ -292,7 +292,10 @@ tracker externalReferenceQueuing goodSuffixes badSuffixes history agent trackCha
 	  			          						return (newRobots, (domain, newRobots) : robots_)
 	  			          		if isRobotsConform specRobots u
 	  			          		then do
-	  			          			if externalReferenceQueuing then (lift $ putQueuingReference outputChannel $!! u) else (forward $!! u)
+	  			          			forM_ externalQueueOutputs $ \ externalQueueOutput -> do
+	  			          				lift $ hPutStrLn externalQueueOutput $ show u
+	  			          				lift $ hFlush externalQueueOutput
+	  			          			when (not disableInternalQueue) (forward $!! u)
 	  			          			return (badSuffixes_, uText `insert` history_, newAllRobots)
 	  			          		else do
 	  			          			lift $ log outputChannel $!! T.pack $ "robots discards " ++ (show u)
@@ -303,7 +306,8 @@ tracker externalReferenceQueuing goodSuffixes badSuffixes history agent trackCha
 data Flag = Help | LoopRestriction (URI -> URI -> Bool) | UserAgent String | MaxTimeOut Int | MaxWaitingTime Int |
             BadSuffixes FilePath | Histories FilePath | BadSuffix String | History String | 
 						Pattern ParserOutput | FileCaching String | ReadFromStdInput | GoodSuffixes FilePath | GoodSuffix String |
-						ResponseChannelBound Int | HandleReferenceQueueOutside
+						ResponseChannelBound Int | HandleReferenceQueueOutside | ExternalQueueInput FilePath | ExternalQueueOutput FilePath |
+						DisableInternalQueue
 
 options :: [OptDescr Flag]
 options = [
@@ -335,13 +339,16 @@ options = [
 	Option "" ["cache-file"] (ReqArg FileCaching "FILE") "caches crawled resources to some files according to the template FILE",
 	Option "" ["read-input"] (NoArg ReadFromStdInput) "reads urls to crawl also from standard input",
 	Option "" ["response-channel-bound"] (ReqArg (ResponseChannelBound . read) "MAX") "limit response channel to MAX; default is 5",
-	Option "" ["external-ref-queuing"] (NoArg HandleReferenceQueueOutside) "puts out queueing reference to be handled outside"]
+	Option "" ["external-queue-input"] (ReqArg ExternalQueueInput "FILE") "gets seeds directly from FILE",
+	Option "" ["external-queue-output"] (ReqArg ExternalQueueOutput "FILE") "prints out seeds directly to FILE",
+	Option "" ["disable-internal-queue"] (NoArg DisableInternalQueue) "disables internal queueing of seeds"]
 
 
 main :: IO ()
 main = do
 	(originSeeds, loopRestrictions, userAgent, timeOut, sleepTime, badSuffixes, goodSuffixes, history,
-		patterns, fileCaching, readStdInput, responseChannelBound, externalReferenceQueuing) <- getArgs >>= (\args ->
+		patterns, fileCaching, readStdInput, responseChannelBound, externalQueueInputs, externalQueueOutputs,
+		disableInternalQueue) <- getArgs >>= (\args ->
 		case getOpt Permute options args of
 			(o,n,[]) -> do
 				-- help flag anywhere ?
@@ -391,16 +398,34 @@ main = do
 				-- takes bound for response channel; default is 5
 				let responseChannelBound = fromMaybe 5 $ listToMaybe $
 					mapMaybe (\f -> case f of {(ResponseChannelBound v) -> Just v; _ -> Nothing}) o
-				-- external reference queuing ?
-				let externalReferenceQueuing = any (\f -> case f of {HandleReferenceQueueOutside -> True; _ -> False}) o
+				-- external queue input
+				let externalQueueInputs = mapMaybe (\f -> case f of {ExternalQueueInput p -> Just p; _ -> Nothing}) o
+				externalQueueOutputs <- mapM (\p -> openFile p WriteMode) $ mapMaybe (\f -> case f of {ExternalQueueOutput p -> Just p; _ -> Nothing}) o
+				let disableInternalQueue = any (\f -> case f of {DisableInternalQueue -> True; _ -> False}) o
 				return (validSeeds, loopRestrictions, userAgent, timeOut, sleepTime, badSuffixes, goodSuffixes,
-				    	history, patterns, fileCaching, readFromInput, responseChannelBound, externalReferenceQueuing)
+				    	history, patterns, fileCaching, readFromInput, responseChannelBound,
+				    	externalQueueInputs, externalQueueOutputs, disableInternalQueue)
 			(_,_,errs) -> ioError (userError (concat errs ++ usageInfo "usage: crawler [OPTION ...] urls..." options)))
 	seedChannel <- C.newChan
 	responseChannel <- B.newBoundedChan responseChannelBound
 	outputChannel <- C.newChan
 	trackChannel <- C.newChan
+	--
+	-- external queue inputs
+	--
+	forM_ externalQueueInputs $ \externalQueueInput -> forkIO $ do
+			log outputChannel $ T.pack $ "external queue input thread for \'" ++ externalQueueInput ++ "\' started"
+			withFile externalQueueInput ReadMode $ \h -> do
+				contents <- hGetContents h
+				let possibleUrls = map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) $ lines contents
+				forM_ possibleUrls (\t -> case t of
+					Left s -> log outputChannel $ T.pack $ "invalid absolute uri \"" ++ s ++ "\" will be ignored!"
+					Right u -> writeRingChan seedChannel u)
+				--closeOutputChan outputChannel
+				--signalLastRingChan seedChannel
+	--		
 	-- download thread
+	--
 	void $ forkIO $ do
 		log outputChannel $ T.pack "download thread started"
 		let downloadSettings = DownloadSettings{
@@ -414,7 +439,9 @@ main = do
 			Left e -> error $ "download thread: exception " ++ show (e :: SomeException)
 			Right _ -> log outputChannel $ T.pack "download thread stopped"
 		closeOutputChan outputChannel
+	--
 	-- parser thread
+	--
 	void $ forkIO $ do
 		log outputChannel $ T.pack "parser thread started"
 		let parserSettings = ParserSettings {
@@ -426,10 +453,12 @@ main = do
 			Left e -> error $ "parser thread: exception " ++ show (e :: SomeException)
 			Right _ -> log outputChannel $ T.pack "parser thread stopped"
 		closeOutputChan outputChannel
+	--
 	-- tracker thread
+	--
 	void $ forkIO $ do
 		log outputChannel $ T.pack "tracker thread started"
-		trackerResult <- try $ tracker externalReferenceQueuing goodSuffixes badSuffixes history userAgent
+		trackerResult <- try $ tracker externalQueueOutputs disableInternalQueue goodSuffixes badSuffixes history userAgent
 		                               trackChannel seedChannel outputChannel
 		case trackerResult of
 			Left e -> error $ "tracker thread: exception " ++ show (e :: SomeException)
@@ -437,18 +466,22 @@ main = do
 		closeOutputChan outputChannel
 	-- stream into track channel
 	writeListRingChan trackChannel $ map NewSeed originSeeds
+	--
 	-- input thread
+	--
 	when readStdInput $ void $ forkIO $ do
 		getContents >>= return . map (\t -> maybe (Left t) Right $ parseAbsoluteURI t) . lines >>= mapM_ (\t -> case t of
 			Left s -> log outputChannel $ T.pack $ "invalid absolute uri \"" ++ s ++ "\" will be ignored!"
-			Right u -> writeRingChan trackChannel $ NewSeed u)
+			Right u -> writeRingChan trackChannel (NewSeed u))
 		closeOutputChan outputChannel
 		signalLastRingChan trackChannel
 	-- in case we dont read from standard input we have to give here
 	-- an exta signal for the situation that no new url is coming in
 	-- into the ring pipe from the outside
 	when (not readStdInput) (signalLastRingChan trackChannel)
+	--
 	-- output thread is on main thread since it indirectly synchronises all threads
+	--
 	runOutput outputChannel (3 + (if readStdInput then 1 else 0)) $ \t -> case t of
 		StdOut m -> TIO.hPutStrLn stdout m;
 		StdErr m -> TIO.hPutStrLn stderr m >> hFlush stderr;
