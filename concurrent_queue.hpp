@@ -19,24 +19,23 @@ class concurrent_queue
 		Queue _queue;
 		std::mutex _mutex;
 		std::condition_variable _condition;
+		bool _closed = false;
 
 	public:
 
-		T pop()
+		void close()
 		{
 			std::unique_lock<std::mutex> locker(_mutex);
-			while (_queue.empty()) _condition.wait(locker);
-			auto t = _queue.front();
-			_queue.pop();
-			return t;
+			_closed = true;
 		}
 		
 		bool try_pop (T & t)
 		{
 			bool success;
 			std::unique_lock<std::mutex> locker(_mutex);
-			if (_queue.empty()) success = false;
-			else                success = true, t = _queue.front();
+			while (not _closed && _queue.empty()) _condition.wait(locker);
+			if (not _queue.empty()) success = true, t = _queue.front(), _queue.pop();			
+			else success = false;
 			return success;
 		}
 
@@ -44,24 +43,27 @@ class concurrent_queue
 		{
 			std::unique_lock<std::mutex> locker(_mutex);
 			_queue.push(t);
+			_closed = false;
 			locker.unlock();
-			_condition.notify_one();
+			_condition.notify_all();
 		}
 
 		void push(T && t)
 		{
 			std::unique_lock<std::mutex> locker(_mutex);
 			_queue.push(std::move(t));
+			_closed = false;
 			locker.unlock();
-			_condition.notify_one();
+			_condition.notify_all();
 		}
 
 		template <typename InputIterator>
 		void push(InputIterator begin, InputIterator end)
 		{
-			std::unique_lock<std::mutex> locker(_mutex);
+			std::unique_lock<std::mutex> locker(_mutex);			
 			for (auto iter = begin; iter != end; ++iter)
 				_queue.push_back(std::move(*iter));
+			_closed = false;
 			locker.unlock();
 			_condition.notify_all();
 		}
