@@ -6,8 +6,8 @@
 #include <string>
 #include <queue>
 #include <thread>
+#include <atomic>
 #include "concurrent_queue.hpp"
-
 
 int main (const int argc, const char ** argv)
 {
@@ -20,18 +20,17 @@ int main (const int argc, const char ** argv)
 		while (std::cin)
 		{
 			std::getline(std::cin, seed);
-			seeds.push(std::move(seed));
+			if (not seed.empty())
+				seeds.push(std::move(seed));
 		}
+		
+		seeds.close();
 	});
 	
 	auto writer = std::thread([&seeds]()
 	{
 		std::string seed;
-		while (std::cout)
-		{
-			seed = seeds.pop();
-			std::cout << seed << std::endl;
-		}
+				
 		while (seeds.try_pop(seed) && std::cout)
 		{
 			std::cout << seed << std::endl;
